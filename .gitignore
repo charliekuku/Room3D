@@ -1,0 +1,42 @@
+# Model weights — download via setup.sh / auto-download on first run
+checkpoints/
+
+# Upstream repo — cloned by setup.sh
+vggt_omega_repo/
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Secrets
+.env
+
+# Sample / test data
+chess/
+
+# Generated 3D outputs
+*.glb
+*.ply
+*.obj
+*.stl
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code local state (machine-specific; CLAUDE.md in root is kept)
+.claude/
+
+# gstack
+.gstack/

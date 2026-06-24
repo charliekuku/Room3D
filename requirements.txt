@@ -1,0 +1,10 @@
+# Room3D app-level requirements
+# Heavy deps (torch, trimesh, gradio, opencv, scipy, matplotlib) come from
+# vggt_omega_repo/requirements.txt and requirements_demo.txt via setup.sh.
+
+scikit-image>=0.19       # TSDF marching cubes (tsdf_fusion.py)
+huggingface_hub>=0.20    # checkpoint auto-download
+python-dotenv>=1.0       # loads .env
+transformers>=4.40       # Grounding DINO object detection
+pymeshlab>=2023.12       # Poisson surface reconstruction (optional — only needed for Mesh (Poisson) mode)
+google-genai>=1.0        # Gemini Vision label suggestion (optional — needs GEMINI_API_KEY)
