@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Room3D setup — clones VGGT-Omega and installs all dependencies
-set -euo pipefail
+set -eu
+set -o pipefail
 
 echo "=== Room3D Setup (VGGT-Omega) ==="
+
+# Check Python version
+python3 -c "import sys; assert sys.version_info >= (3,10), 'Python 3.10+ required (got ' + sys.version + ')'" || exit 1
 
 # 1. Clone VGGT-Omega into vggt_omega_repo/
 if [ -d "vggt_omega_repo" ]; then
@@ -25,7 +29,6 @@ echo "[2/3] Installing Python dependencies…"
 pip install -r vggt_omega_repo/requirements.txt
 pip install -e vggt_omega_repo/          # editable install for the vggt_omega package
 pip install -r vggt_omega_repo/requirements_demo.txt
-pip install huggingface_hub              # needed for automatic checkpoint download
 
 # 3. Install our app-level requirements
 echo "[3/3] Installing app requirements…"
@@ -38,7 +41,7 @@ echo "Before first run, download the model weights:"
 echo "  1. Request access at https://huggingface.co/facebook/VGGT-Omega"
 echo "  2. Once approved: huggingface-cli login"
 echo "  3. The app will auto-download on first launch, OR manually:"
-echo "       hf download facebook/VGGT-Omega vggt_omega_1b_512.pt --local-dir checkpoints"
+echo "       huggingface-cli download facebook/VGGT-Omega vggt_omega_1b_512.pt --local-dir checkpoints"
 echo ""
 echo "Start the demo:"
 echo "  python app.py"
