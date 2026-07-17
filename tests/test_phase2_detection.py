@@ -7,11 +7,13 @@ import os
 import sys
 
 import numpy as np
+import trimesh
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "vggt_omega_repo"))
 
 from src.detection import scene_builder as sb
+from src.detection.dedup import suppress_overlapping_boxes
 
 
 def _box_points(center, size, yaw=0.0, n=3000, seed=0):
@@ -62,6 +64,594 @@ def test_cluster_merges_same_object_and_keeps_separate_ones():
     instances = sb.cluster_observations(obs)
     assert len(instances) == 2, f"expected 2 instances, got {len(instances)}"
     assert sorted(i["frames_seen"] for i in instances) == [2, 3]
+
+
+def test_cross_label_duplicate_uses_multi_frame_label_evidence():
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    obs = []
+    # Correct label appears consistently; a higher-scoring wrong phrase appears
+    # once on the same box and same 3-D points.
+    for frame in range(3):
+        obs.append(sb._make_observation(
+            "table", 0.58, frame,
+            _box_points([0, 0.4, 0], [1.6, 0.8, 0.8], seed=frame), cols,
+            box=np.array([20, 20, 180, 140]), det_idx=0,
+        ))
+    obs.append(sb._make_observation(
+        "cabinet", 0.82, 1,
+        _box_points([0.01, 0.4, 0.01], [1.6, 0.8, 0.8], seed=20), cols,
+        box=np.array([22, 21, 179, 141]), det_idx=1,
+    ))
+    # A real monitor overlaps the table spatially but not with a near-identical
+    # image box, so it must remain its own instance.
+    obs.append(sb._make_observation(
+        "monitor", 0.75, 1,
+        _box_points([0, 0.85, 0], [0.5, 0.35, 0.15], seed=30), cols,
+        box=np.array([75, 30, 125, 80]), det_idx=2,
+    ))
+
+    instances = sb.cluster_observations(obs)
+
+    assert sorted(i["label"] for i in instances) == ["monitor", "table"]
+    table = next(i for i in instances if i["label"] == "table")
+    assert table["frames_seen"] == 3
+    assert len(table["obs_refs"]) == 4
+
+
+def test_cluster_keeps_same_frame_neighbours_separate():
+    """Two adjacent chairs, close enough for the proximity threshold to merge
+    them, but drawn as distinct boxes in every shared frame. The detector
+    already separated them, so they must stay two instances — this is the
+    chair-around-a-table over-merge that dropped one chair from the scene."""
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    obs = []
+    for frame in range(3):
+        # Chair A and chair B ~0.45 m apart (< 0.6·diag ≈ 0.6 m ⇒ proximity
+        # alone would merge them), non-overlapping image boxes.
+        obs.append(sb._make_observation(
+            "chair", 0.66, frame,
+            _box_points([0.0, 0.4, 0.0], [0.5, 0.85, 0.5], seed=frame), cols,
+            box=np.array([10, 50, 90, 200]), det_idx=0,
+        ))
+        obs.append(sb._make_observation(
+            "chair", 0.64, frame,
+            _box_points([0.45, 0.4, 0.0], [0.5, 0.85, 0.5], seed=10 + frame), cols,
+            box=np.array([95, 50, 175, 200]), det_idx=1,
+        ))
+
+    instances = sb.cluster_observations(obs)
+    assert len(instances) == 2, f"adjacent chairs collapsed: got {len(instances)}"
+    assert all(i["frames_seen"] == 3 for i in instances)
+
+
+def test_cluster_still_merges_duplicate_box_same_frame():
+    """A repeated grounding of one object in a single frame (high box-IoU) is a
+    duplicate, not a second object — the same-frame guard must let it merge so
+    genuine duplicates don't split into phantom instances."""
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    obs = []
+    for frame in range(3):
+        obs.append(sb._make_observation(
+            "chair", 0.66, frame,
+            _box_points([0.0, 0.4, 0.0], [0.5, 0.85, 0.5], seed=frame), cols,
+            box=np.array([10, 50, 90, 200]), det_idx=0,
+        ))
+    # Duplicate detection of the same chair in frame 0 (near-identical box).
+    obs.append(sb._make_observation(
+        "chair", 0.60, 0,
+        _box_points([0.01, 0.4, 0.01], [0.5, 0.85, 0.5], seed=99), cols,
+        box=np.array([12, 52, 92, 202]), det_idx=1,
+    ))
+
+    instances = sb.cluster_observations(obs)
+    assert len(instances) == 1, f"duplicate box split object: got {len(instances)}"
+
+
+def test_cluster_associates_same_object_across_different_labels():
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    obs = [
+        sb._make_observation(
+            label, score, frame,
+            _box_points([0.02 * frame, 0.4, 0], [0.5, 0.85, 0.5], seed=frame), cols,
+            box=np.array([10, 50, 90, 200]), det_idx=0,
+        )
+        for frame, (label, score) in enumerate([
+            ("chair", 0.62), ("office seat", 0.70), ("chair", 0.64),
+        ])
+    ]
+
+    instances = sb.cluster_observations(obs)
+    assert len(instances) == 1
+    assert instances[0]["frames_seen"] == 3
+    assert instances[0]["label"] == "chair", "multi-frame label evidence should win"
+
+
+def test_duplicate_cleanup_merges_disjoint_tracks_with_same_3d_volume():
+    """Ambiguity can split one physical object into early/late tracks which
+    never share a frame. Strong 3-D coincidence should reunite them."""
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    early = [
+        sb._make_observation(
+            "chair", 0.65, frame,
+            _box_points([0.01 * frame, 0.4, 0], [0.5, 0.85, 0.5], seed=frame), cols,
+            box=np.array([10, 50, 90, 200]), det_idx=0,
+        )
+        for frame in (0, 1)
+    ]
+    late = [
+        sb._make_observation(
+            "office seat", 0.62, frame,
+            _box_points([0.01, 0.4, 0.01], [0.5, 0.85, 0.5], seed=20 + frame), cols,
+            box=np.array([12, 52, 92, 202]), det_idx=0,
+        )
+        for frame in (2, 3)
+    ]
+
+    merged = sb._merge_cross_label_duplicates([
+        sb._instance_from_observations(early),
+        sb._instance_from_observations(late),
+    ])
+
+    assert len(merged) == 1
+    assert merged[0]["frames_seen"] == 4
+    assert merged[0]["label"] == "chair"
+
+
+def test_duplicate_cleanup_respects_same_frame_distinct_boxes():
+    """Even coincident noisy depth must not merge objects seen separately."""
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    a = sb._make_observation(
+        "chair", 0.68, 0, _box_points([0, 0.4, 0], [0.5, 0.85, 0.5]), cols,
+        box=np.array([10, 50, 80, 200]), det_idx=0,
+    )
+    b = sb._make_observation(
+        "chair", 0.66, 0, _box_points([0.02, 0.4, 0], [0.5, 0.85, 0.5], seed=1), cols,
+        box=np.array([100, 50, 170, 200]), det_idx=1,
+    )
+
+    merged = sb._merge_cross_label_duplicates([
+        sb._instance_from_observations([a]),
+        sb._instance_from_observations([b]),
+    ])
+    assert len(merged) == 2
+
+
+def test_duplicate_cleanup_does_not_merge_nested_different_scale_objects():
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    table = sb._make_observation(
+        "table", 0.7, 0, _box_points([0, 0.5, 0], [1.6, 0.8, 0.8]), cols,
+        box=np.array([10, 30, 180, 180]), det_idx=0,
+    )
+    monitor = sb._make_observation(
+        "monitor", 0.7, 1, _box_points([0, 0.7, 0], [0.5, 0.4, 0.15], seed=1), cols,
+        box=np.array([60, 40, 120, 100]), det_idx=0,
+    )
+    merged = sb._merge_cross_label_duplicates([
+        sb._instance_from_observations([table]),
+        sb._instance_from_observations([monitor]),
+    ])
+    assert len(merged) == 2
+
+
+def test_cluster_recovers_object_seen_only_after_anchor_track_stabilizes():
+    """A later adjacent object must seed a new identity rather than being
+    swallowed by a broad object-size radius around an established track."""
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    obs = []
+    for frame, x, score in [(0, 0.00, 0.80), (1, 0.02, 0.75),
+                            (2, 0.45, 0.68), (3, 0.46, 0.66)]:
+        obs.append(sb._make_observation(
+            "object", score, frame,
+            _box_points([x, 0.4, 0], [0.5, 0.85, 0.5], seed=frame), cols,
+            box=np.array([20, 40, 100, 190]), det_idx=0,
+        ))
+
+    instances = sb.cluster_observations(obs)
+    assert len(instances) == 2, "late adjacent object was merged into the stable track"
+    assert sorted(i["frames_seen"] for i in instances) == [2, 2]
+
+
+def test_cluster_prevents_transitive_center_chain():
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    obs = []
+    # A broad greedy radius can chain 0.00 → 0.18 → 0.42 into one instance
+    # even though the endpoints are separate physical modes.
+    for frame, x in enumerate([0.00, 0.18, 0.42, 0.43]):
+        obs.append(sb._make_observation(
+            "item", 0.72 - frame * 0.01, frame,
+            _box_points([x, 0.4, 0], [0.5, 0.85, 0.5], seed=20 + frame), cols,
+            box=np.array([15, 45, 95, 195]), det_idx=0,
+        ))
+
+    instances = sb.cluster_observations(obs)
+    assert len(instances) == 2, "transitive proximity chain collapsed two spatial modes"
+
+
+def test_cluster_preserves_six_repeated_objects_under_partial_visibility():
+    """General repeated-object regression modeled on a crowded room: no frame
+    needs to see all six, labels may vary, and adjacent objects remain distinct."""
+    cols = np.zeros((3000, 3), dtype=np.uint8)
+    visible = {
+        0: [0, 1, 2, 3, 4],
+        1: [0, 1, 2, 3, 5],
+        2: [2, 3, 4, 5],
+    }
+    obs = []
+    for frame, object_ids in visible.items():
+        for slot, object_id in enumerate(object_ids):
+            x = 0.45 * object_id + 0.01 * frame
+            label = "seat" if (frame + object_id) % 4 == 0 else "chair"
+            obs.append(sb._make_observation(
+                label, 0.66, frame,
+                _box_points([x, 0.4, 0], [0.5, 0.85, 0.5],
+                            seed=100 + 10 * frame + object_id), cols,
+                box=np.array([10 + 90 * slot, 50, 85 + 90 * slot, 200]),
+                det_idx=slot,
+            ))
+
+    instances = sb.cluster_observations(obs)
+    assert len(instances) == 6, f"expected six physical instances, got {len(instances)}"
+    assert all(inst["frames_seen"] >= 2 for inst in instances)
+
+
+def test_frame_nms_keeps_cross_label_candidates_for_3d_voting():
+    boxes = np.array([
+        [10, 10, 100, 100],
+        [11, 10, 101, 100],
+        [10, 10, 100, 100],
+    ])
+    labels = ["table", "table", "cabinet"]
+    scores = np.array([0.8, 0.7, 0.75])
+
+    assert suppress_overlapping_boxes(boxes, labels, scores) == [0, 2]
+
+
+def test_group_duplicates():
+    # Two near-identical chairs, one distinctly bigger chair, two matching racks.
+    placed = [
+        {"label": "chair", "placement": {"size": [0.50, 0.90, 0.50]}},
+        {"label": "chair", "placement": {"size": [0.52, 0.88, 0.49]}},   # dup of [0]
+        {"label": "chair", "placement": {"size": [0.90, 1.40, 0.90]}},   # different chair
+        {"label": "server rack", "placement": {"size": [0.60, 2.00, 1.00]}},
+        {"label": "server rack", "placement": {"size": [0.60, 2.00, 1.02]}},  # dup of [3]
+    ]
+    groups = [sorted(g) for g in sb._group_duplicates(placed, size_rel_tol=0.15)]
+    assert sorted(groups) == [[0, 1], [2], [3, 4]], groups
+
+
+def test_group_duplicates_respects_orientation_swap():
+    # Same label + same extents but width/depth swapped → 90° apart. Reusing one
+    # asset would render it rotated wrong, so they must stay separate groups.
+    placed = [
+        {"label": "server rack", "placement": {"size": [0.60, 2.00, 1.00]}},
+        {"label": "server rack", "placement": {"size": [1.00, 2.00, 0.60]}},
+    ]
+    assert len(sb._group_duplicates(placed)) == 2
+
+
+def test_group_duplicates_singletons_when_disabled_semantics():
+    # Distinct labels never merge, even at identical sizes.
+    placed = [
+        {"label": "desk", "placement": {"size": [1.2, 0.75, 0.6]}},
+        {"label": "monitor", "placement": {"size": [1.2, 0.75, 0.6]}},
+    ]
+    assert len(sb._group_duplicates(placed)) == 2
+
+
+def test_scan_mesh_quality_uses_original_point_support():
+    good = trimesh.creation.icosphere(subdivisions=3, radius=0.5)
+    good.apply_translation([0, 0.5, 0])
+    observed, _ = trimesh.sample.sample_surface(good, 3000, seed=2)
+
+    quality = sb._scan_mesh_quality(good, observed, [1, 1, 1], frames_seen=3)
+    assert quality["good"]
+    assert quality["support"] > 0.95
+
+    fragment = trimesh.creation.icosphere(subdivisions=2, radius=0.05)
+    fragment.apply_translation([0, 0.05, 0])
+    quality = sb._scan_mesh_quality(fragment, observed, [1, 1, 1], frames_seen=3)
+    assert not quality["good"]
+    assert quality["bbox_agreement"] < 0.2
+
+
+def test_raw_scan_glb_round_trip():
+    import tempfile
+    from pathlib import Path
+
+    pts = np.random.default_rng(0).normal(size=(500, 3)).astype(np.float32)
+    cols = np.tile(np.array([30, 120, 240], np.uint8), (len(pts), 1))
+    with tempfile.TemporaryDirectory() as tmp:
+        path = Path(tmp) / "raw_scan.glb"
+        assert sb._export_raw_scan(pts, cols, str(path)) == len(pts)
+        loaded = trimesh.load(path, process=False)
+        geometries = list(loaded.geometry.values())
+        assert len(geometries) == 1
+        assert isinstance(geometries[0], trimesh.PointCloud)
+        assert len(geometries[0].vertices) == len(pts)
+
+
+def test_room_surface_coverage_distinguishes_observed_and_missing_planes():
+    rng = np.random.default_rng(4)
+    floor = np.column_stack([
+        rng.uniform(-2, 2, 4000), np.zeros(4000), rng.uniform(-3, 3, 4000),
+    ])
+    wall_xmin = np.column_stack([
+        np.full(2500, -2.0), rng.uniform(0, 3, 2500), rng.uniform(-3, 3, 2500),
+    ])
+    coverage = sb._room_surface_coverage(
+        np.vstack([floor, wall_xmin]), np.eye(3), (-2, 2, -3, 3), 3.0,
+    )
+
+    assert coverage["floor"] > 0.9
+    assert coverage["wall_0"] > 0.7
+    assert coverage["wall_1"] == 0.0
+
+
+def test_wall_cell_classifier_fills_occlusion_but_preserves_opening():
+    observed = np.zeros((8, 10), bool)
+    occluded = np.zeros_like(observed, dtype=np.uint16)
+    semantic = np.zeros_like(observed)
+    through = np.zeros_like(observed, dtype=np.uint16)
+    occluded[4, 5] = 1
+
+    fill = sb._classify_wall_cells(observed, occluded, semantic, through)
+    assert fill[4, 5]
+
+    semantic[4, 5] = True
+    fill = sb._classify_wall_cells(observed, occluded, semantic, through)
+    assert not fill[4, 5], "door/window evidence must override occlusion"
+
+    semantic[:] = False
+    through[4, 5] = 2
+    fill = sb._classify_wall_cells(observed, occluded, semantic, through)
+    assert not fill[4, 5], "multi-view depth beyond the wall indicates an opening"
+
+
+def test_wall_ray_classification_distinguishes_object_and_opening():
+    rect = (-2.0, 2.0, -3.0, 3.0)
+    spec = sb._wall_spec(3, rect)  # z=+3 wall
+    shape = sb._wall_grid_shape(spec, ceil_h=3.0)
+    camera = np.array([0.0, 1.5, 0.0])
+
+    # Object is in front of the wall, so its ray reaches the wall after t=1.
+    iy, iu = sb._ray_wall_cells(
+        camera, np.array([[0.0, 1.5, 1.0]]), spec, 3.0, shape, "occluded"
+    )
+    assert len(iy) == 1
+
+    # A reconstructed point beyond the wall crosses it before reaching depth.
+    ty, tu = sb._ray_wall_cells(
+        camera, np.array([[0.0, 1.5, 4.0]]), spec, 3.0, shape, "through"
+    )
+    assert len(ty) == 1
+    assert (iy[0], iu[0]) == (ty[0], tu[0])
+
+
+def test_wall_fill_mesh_patches_only_selected_cells():
+    fill = np.zeros((4, 6), bool)
+    fill[1:3, 2:4] = True
+    mesh = sb._wall_fill_mesh(
+        0, fill, (-2.0, 2.0, -3.0, 3.0), 3.0, np.eye(3), (128, 128, 128)
+    )
+    assert mesh is not None
+    assert len(mesh.faces) == 12, "contiguous cells should merge into one box"
+    assert mesh.bounds[1, 0] < -2.0, "patch sits behind the fitted wall plane"
+
+
+def test_opening_label_vocabulary():
+    assert sb._is_opening_label("glass door")
+    assert sb._is_opening_label("office window")
+    assert not sb._is_opening_label("cabinet")
+
+
+def test_instance_exclusion_mask_omits_rejected_and_opening_objects():
+    masks = [[np.ones((8, 8), bool), np.ones((8, 8), bool)]]
+    furniture = {"label": "chair", "obs_refs": [(0, 0)]}
+    opening = {"label": "door", "obs_refs": [(0, 1)]}
+
+    kept = sb._exclude_mask_for_instances([furniture, opening], masks, (1, 4, 4))
+    opening_only = sb._exclude_mask_for_instances([opening], masks, (1, 4, 4))
+    rejected = sb._exclude_mask_for_instances([], masks, (1, 4, 4))
+
+    assert kept.all(), "movable object pixels should remain excluded from background TSDF"
+    assert not opening_only.any(), "doors/windows should remain in the architectural background"
+    assert not rejected.any(), "rejected detections must not leave background holes"
+
+
+def test_horizontal_infill_fills_only_missing_floor_and_ceiling_cells():
+    # Multiple samples support the centre of each plane. Distant unseen cells
+    # remain eligible for infill.
+    points = np.array([
+        [0.0, 0.0, 0.0], [0.01, 0.0, 0.01], [0.02, 0.0, 0.02],
+        [0.0, 3.0, 0.0], [0.01, 3.0, 0.01], [0.02, 3.0, 0.02],
+    ])
+    evidence = sb._horizontal_infill_evidence(
+        points, np.eye(3), (-1.0, 1.0, -1.0, 1.0), 3.0,
+    )
+
+    for surface in ("floor", "ceiling"):
+        ev = evidence[surface]
+        assert ev["observed"].sum() == 1
+        assert not ev["fill"][5, 5]
+        assert ev["fill"][0, 0]
+
+
+def test_horizontal_infill_ignores_isolated_depth_noise():
+    evidence = sb._horizontal_infill_evidence(
+        np.array([[0.0, 0.0, 0.0], [0.0, 3.0, 0.0]]),
+        np.eye(3), (-1.0, 1.0, -1.0, 1.0), 3.0,
+    )
+
+    assert evidence["floor"]["support_count"][5, 5] == 1
+    assert evidence["floor"]["fill"][5, 5]
+    assert evidence["ceiling"]["fill"][5, 5]
+
+
+def test_horizontal_fill_mesh_sits_behind_the_surface_plane():
+    fill = np.zeros((4, 6), bool)
+    fill[1:3, 2:4] = True
+    floor = sb._horizontal_fill_mesh(
+        "floor", fill, (-2.0, 2.0, -3.0, 3.0), 3.0,
+        np.eye(3), (128, 128, 128),
+    )
+    ceiling = sb._horizontal_fill_mesh(
+        "ceiling", fill, (-2.0, 2.0, -3.0, 3.0), 3.0,
+        np.eye(3), (128, 128, 128),
+    )
+
+    assert floor is not None and ceiling is not None
+    assert len(floor.faces) == 12 and len(ceiling.faces) == 12
+    assert floor.bounds[1, 1] < 0.0
+    assert ceiling.bounds[0, 1] > 3.0
+
+
+def test_horizontal_color_field_interpolates_neighbouring_surface_appearance():
+    images = np.zeros((1, 3, 2, 2), np.float32)
+    images[0, 0, :, 0] = 1.0       # two red samples in the left cell
+    images[0, 2, :, 1] = 1.0       # two blue samples in the right cell
+    world_pts = np.array([[[[0.2, 0.0, 0.3], [2.8, 0.0, 0.3]],
+                            [[0.2, 0.0, 0.7], [2.8, 0.0, 0.7]]]])
+    colors, observed = sb._horizontal_color_field(
+        "floor", images, world_pts, np.ones((1, 2, 2), bool),
+        np.eye(4), 1.0, np.zeros(3), np.eye(3),
+        (0.0, 3.0, 0.0, 1.0), 3.0, (1, 3), (128, 128, 128),
+    )
+
+    assert observed.tolist() == [[True, False, True]]
+    assert colors[0, 0, 0] > 240 and colors[0, 0, 2] < 10
+    assert colors[0, 2, 2] > 240 and colors[0, 2, 0] < 10
+    assert colors[0, 1, 0] > 80 and colors[0, 1, 2] > 80
+
+
+def test_horizontal_fill_mesh_uses_spatially_varying_cell_colors():
+    fill = np.array([[True, True]])
+    colors = np.array([[[240, 20, 10], [10, 20, 240]]], np.uint8)
+    mesh = sb._horizontal_fill_mesh(
+        "floor", fill, (0.0, 2.0, 0.0, 1.0), 3.0,
+        np.eye(3), (128, 128, 128), color_field=colors,
+    )
+
+    assert mesh is not None and len(mesh.faces) == 4
+    assert mesh.bounds[1, 1] < 0.0
+    unique = np.unique(np.asarray(mesh.visual.vertex_colors)[:, :3], axis=0)
+    assert {tuple(c) for c in unique} == {(240, 20, 10), (10, 20, 240)}
+
+
+def test_glb_bytes_to_local_mesh_fits_and_grounds():
+    # A generated GLB comes in at an arbitrary size/offset; the normalizer must
+    # scale its bbox to the detected size and bottom-centre it at the origin.
+    import trimesh
+    box = trimesh.creation.box(extents=[3.0, 4.0, 5.0])
+    box.apply_translation([10.0, -7.0, 2.0])          # arbitrary origin
+    glb_bytes = trimesh.Scene([box]).export(file_type="glb")
+
+    size_m = [1.0, 2.0, 0.5]
+    mesh = sb._glb_bytes_to_local_mesh(glb_bytes, size_m)
+    assert mesh is not None
+    lo, hi = mesh.bounds
+    assert np.allclose(hi - lo, size_m, atol=1e-4), f"extents {hi - lo} != {size_m}"
+    assert abs(lo[1]) < 1e-4, "bottom should sit on y=0"
+    assert abs((lo[0] + hi[0]) / 2) < 1e-4 and abs((lo[2] + hi[2]) / 2) < 1e-4, "not XZ-centred"
+
+
+def test_glb_bytes_to_local_mesh_rejects_garbage():
+    assert sb._glb_bytes_to_local_mesh(b"not a glb", [1, 1, 1]) is None
+
+
+def test_object_crop_rgba_from_mask():
+    import tempfile
+    import cv2
+
+    img = np.zeros((100, 100, 3), np.uint8)
+    img[:] = (30, 60, 90)
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tf:
+        path = tf.name
+    cv2.imwrite(path, img)
+
+    mask = np.zeros((100, 100), bool)
+    mask[30:70, 30:70] = True                       # object occupies the centre
+    inst = {"best_frame": 0, "best_box": [25, 25, 75, 75], "obs_refs": [(0, 0)]}
+
+    crop = sb._object_crop_rgb([path], [[mask]], inst)
+    assert crop is not None and crop.shape[2] == 4, "expected an RGBA cutout"
+    assert crop[..., 3].max() == 255 and crop[..., 3].min() == 0, "alpha should carry fg+bg"
+
+    # No usable mask → plain RGB box crop (3 channels).
+    rgb = sb._object_crop_rgb([path], [[None]], inst)
+    assert rgb is not None and rgb.shape[2] == 3
+
+
+def test_min_area_rect_yaw_aligns_room_not_furniture():
+    rng = np.random.default_rng(0)
+    # A 4×2 m room outline (points along the 4 walls) plus a dense row of
+    # "furniture" running diagonally — a PCA axis would chase the furniture; the
+    # min-area rectangle must lock onto the walls.
+    xs = np.concatenate([rng.uniform(-2, 2, 2000), rng.uniform(-2, 2, 2000),
+                         np.full(2000, -2.0), np.full(2000, 2.0)])
+    zs = np.concatenate([np.full(2000, -1.0), np.full(2000, 1.0),
+                         rng.uniform(-1, 1, 2000), rng.uniform(-1, 1, 2000)])
+    room = np.stack([xs, zs], axis=1)
+    t = np.linspace(-1.5, 1.5, 3000)
+    furniture = np.stack([t, 0.5 * t], axis=1)       # diagonal clutter inside
+    pts = np.vstack([room, furniture])
+
+    th = np.radians(25)                              # rotate the whole thing 25°
+    Rm = np.array([[np.cos(th), -np.sin(th)], [np.sin(th), np.cos(th)]])
+    rot = pts @ Rm.T
+
+    ang = sb._min_area_rect_yaw(rot)
+    ca, sa = np.cos(ang), np.sin(ang)
+    Txz = np.array([[ca, sa], [-sa, ca]])            # the builder's T_yaw XZ block
+    aligned = rot @ Txz.T
+    assert abs(sb._min_area_rect_yaw(aligned)) < np.radians(1.5), "room not grid-aligned"
+    ext = np.sort([np.ptp(aligned[:, 0]), np.ptp(aligned[:, 1])])
+    assert abs(ext[0] - 2) < 0.1 and abs(ext[1] - 4) < 0.1, f"wrong room extents {ext}"
+
+
+def test_yaw_basis_is_orthonormal_roundtrip():
+    R = sb._yaw_basis(np.radians(37))
+    v = np.random.default_rng(0).random((50, 3))
+    assert np.allclose(R @ R.T, np.eye(3), atol=1e-9)
+    assert np.allclose(v @ R.T @ R, v, atol=1e-9)      # world→local→world identity
+
+
+def test_fit_room_rect_finds_wall_planes_not_clutter():
+    rng = np.random.default_rng(0)
+    ceil_h = 3.0
+
+    def wall_x(val, n=3000):                            # plane at x=val
+        p = np.empty((n, 3))
+        p[:, 0] = val + rng.normal(0, 0.01, n)
+        p[:, 1] = rng.uniform(0.2, 2.8, n)
+        p[:, 2] = rng.uniform(-3, 3, n)
+        return p
+
+    def wall_z(val, n=3000):                            # plane at z=val
+        p = np.empty((n, 3))
+        p[:, 0] = rng.uniform(-2, 2, n)
+        p[:, 1] = rng.uniform(0.2, 2.8, n)
+        p[:, 2] = val + rng.normal(0, 0.01, n)
+        return p
+
+    rack = rng.uniform([-0.3, 0, -0.3], [0.3, 2.0, 0.3], (2000, 3))   # interior clutter
+    pts = np.vstack([wall_x(-2), wall_x(2), wall_z(-3), wall_z(3), rack])
+    xmin, xmax, zmin, zmax = sb._fit_room_rect(pts, ceil_h)
+    assert abs(xmin + 2) < 0.05 and abs(xmax - 2) < 0.05, (xmin, xmax)
+    assert abs(zmin + 3) < 0.05 and abs(zmax - 3) < 0.05, (zmin, zmax)
+
+
+def test_carve_room_shell_drops_boundary_keeps_interior():
+    import trimesh
+    R = sb._yaw_basis(0.0)                              # yaw 0 → identity
+    rect = (-2.0, 2.0, -3.0, 3.0)
+    wall = sb._box([0.02, 2.0, 4.0], [2.0, 1.0, 0.0], (128, 128, 128))   # boundary wall at x=2
+    interior = sb._box([0.4, 0.4, 0.4], [0.0, 1.5, 0.0], (128, 128, 128))  # mid-room fixture
+    combined = trimesh.util.concatenate([wall, interior])
+
+    carved = sb._carve_room_shell(combined, R, rect, ceil_h=3.0)
+    assert len(carved.faces) < len(combined.faces), "boundary faces should be dropped"
+    cen = carved.vertices[carved.faces].mean(axis=1)
+    assert cen[:, 0].max() < 1.0, "the x=2 wall should be gone, interior kept"
 
 
 def test_placement_accuracy():
@@ -184,6 +774,37 @@ def test_estimate_up_falls_back_untrusted_on_degenerate_path():
     T_align = sb._scene_transform(exts)
     _, trusted = sb._estimate_up(exts, T_align)
     assert not trusted, "straight-line walk should not yield a trusted path estimate"
+
+
+def test_estimate_up_rejects_vertical_camera_path_plane():
+    """A compact walkthrough plus height drift can form a vertical trajectory
+    plane. Its normal is horizontal, so it must not be accepted as gravity even
+    when the trajectory SVD itself is well-conditioned."""
+    def look_at(pos, tgt, world_up=np.array([0, 0, 1.0])):
+        f = tgt - pos; f /= np.linalg.norm(f)
+        r = np.cross(f, world_up); r /= np.linalg.norm(r)
+        d = np.cross(f, r)
+        Rwc = np.stack([r, d, f], axis=0)
+        return np.hstack([Rwc, (-Rwc @ pos)[:, None]])
+
+    # Positions cover X/Z but have no Y spread: trajectory PCA incorrectly
+    # proposes ±Y as "up", while the upright cameras consistently report +Z.
+    positions = [
+        np.array([x, 0.0, z])
+        for x in np.linspace(-2, 2, 4)
+        for z in np.linspace(0.8, 2.4, 3)
+    ]
+    exts = np.array([look_at(p, p + np.array([0, 5, 0])) for p in positions])
+    T_align = sb._scene_transform(exts)
+
+    path_up = sb._up_from_camera_path(exts, T_align)
+    assert path_up is not None, "fixture must exercise the path sanity check"
+    up, trusted = sb._estimate_up(exts, T_align)
+    expected = T_align[:3, :3] @ np.array([0, 0, 1.0])
+    expected /= np.linalg.norm(expected)
+
+    assert not trusted
+    assert float(up @ expected) > 0.98
 
 
 def test_floor_snap_is_label_aware():

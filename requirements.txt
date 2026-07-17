@@ -1,10 +1,38 @@
 # Room3D app-level requirements
-# Heavy deps (torch, trimesh, gradio, opencv, scipy, matplotlib) come from
-# vggt_omega_repo/requirements.txt and requirements_demo.txt via setup.sh.
+# torch/torchvision/opencv still come from vggt_omega_repo's own requirements
+# files via setup.sh (installed before this file). Everything below is either
+# only ours, or a package our own code imports directly and shouldn't
+# silently depend on an upstream demo file to provide.
 
+# Overrides vggt_omega_repo/requirements_demo.txt's gradio==5.50.0 (its last
+# 5.x release) + gradio-client==1.14.0. Long-running reconstructions previously
+# lived behind one Gradio SSE request and could lose their client connection on
+# Modal. The pipeline is now a detached Modal job with BrowserState + short
+# timer polls; Gradio 6 remains pinned for its queue/connection fixes and has
+# been verified locally (gr.Blocks theme= moved to mount_gradio_app, gr.HTML
+# needs explicit padding=True — both breaking changes handled in app.py).
+gradio==6.20.0
+gradio-client==2.5.0
 scikit-image>=0.19       # TSDF marching cubes (tsdf_fusion.py)
 huggingface_hub>=0.20    # checkpoint auto-download
 python-dotenv>=1.0       # loads .env
-transformers>=4.40       # Grounding DINO object detection
-pymeshlab>=2023.12       # Poisson surface reconstruction (optional — only needed for Mesh (Poisson) mode)
+transformers==5.13.0     # Grounding DINO + SAM2 (Sam2Model/Sam2Processor). Exact-pinned:
+                         # an unbounded floor let pip silently resolve a version that
+                         # dropped Sam2Processor.post_process_masks' reshaped_input_sizes
+                         # arg entirely (not renamed) — a hard crash discovered in prod.
+pymeshlab==2025.7.post1  # Poisson surface reconstruction — used by "Mesh (Poisson)" output
+                         # AND scene_builder's scan-cutout fallback (load-bearing for the
+                         # editable scene now, not just that one output mode). Exact-pinned
+                         # for reproducibility. NOTE: the prod AttributeError
+                         # ('MeshSet' has no 'compute_normal_for_point_clouds') was NOT a
+                         # wrong version — PyMeshLab's filter plugins need libOpenGL.so.0
+                         # (apt: libopengl0) at load time, and without it the meshing
+                         # plugin silently fails to load, "removing" its methods. Fixed in
+                         # modal_app.py's apt_install; keep that in sync if deploying
+                         # elsewhere on Linux.
 google-genai>=1.0        # Gemini Vision label suggestion (optional — needs GEMINI_API_KEY)
+fastapi[standard]>=0.100 # scene editor API server + bundles uvicorn (app.py build_server)
+trimesh                  # GLB export, scene graphs (scene_builder.py, tsdf_fusion.py)
+matplotlib               # colormaps (tsdf_fusion.py, app.py)
+scipy                    # required by vggt_omega_repo/visual_util.py (module-level import)
+requests                 # required by vggt_omega_repo/visual_util.py (module-level import)

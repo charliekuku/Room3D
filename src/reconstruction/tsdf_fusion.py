@@ -21,6 +21,8 @@ import trimesh
 
 
 _PYMESHLAB_SCRIPT = """
+import os
+os.environ["QT_QPA_PLATFORM"] = "offscreen"
 import sys, pickle, numpy as np, pymeshlab
 in_path, out_path = sys.argv[1], sys.argv[2]
 with open(in_path, "rb") as f:
@@ -45,10 +47,16 @@ def _run_poisson_subprocess(all_points: np.ndarray, all_colors_u8: np.ndarray, d
         in_path = f.name
     out_path = in_path + ".out.pkl"
     try:
-        subprocess.run(
+        res = subprocess.run(
             [sys.executable, "-c", _PYMESHLAB_SCRIPT, in_path, out_path],
-            check=True, timeout=300,
+            capture_output=True, text=True, timeout=300,
         )
+        if res.returncode != 0:
+            raise RuntimeError(
+                f"PyMeshLab subprocess failed with exit code {res.returncode}.\n"
+                f"STDOUT:\n{res.stdout}\n"
+                f"STDERR:\n{res.stderr}"
+            )
         with open(out_path, "rb") as f:
             return pickle.load(f)
     finally:
@@ -62,11 +70,12 @@ def _run_poisson_subprocess(all_points: np.ndarray, all_colors_u8: np.ndarray, d
 @dataclass
 class TSDFConfig:
     conf_percentile: float = 20.0   # same semantics as the point-cloud conf_thres slider
-    auto_resolution: int = 256      # target voxels along the scene's longest axis
+    auto_resolution: int = 256      # target voxels along the volume's diagonal
     sdf_trunc_factor: float = 4.0   # sdf_trunc = factor × voxel_length
     min_cluster_faces: int = 500    # remove floater components smaller than this
     filter_depth_edges: bool = True
     depth_edge_rtol: float = 0.03
+    max_dim: int = 192              # per-axis voxel cap (memory guard)
 
 
 def predictions_to_mesh_glb(
@@ -83,14 +92,26 @@ def predictions_to_mesh_glb(
     return fuse_tsdf(predictions, config, show_cam=show_cam)
 
 
-def fuse_tsdf(
+def fuse_tsdf_raw_mesh(
     predictions: dict,
     config: TSDFConfig,
-    show_cam: bool = False,
-) -> trimesh.Scene:
-    """TSDF fusion via numpy + skimage marching cubes (no open3d dependency)."""
+    exclude_mask: np.ndarray | None = None,
+    include_mask: np.ndarray | None = None,
+    bounds: tuple[np.ndarray, np.ndarray] | None = None,
+) -> trimesh.Trimesh:
+    """TSDF fusion returning the mesh in raw (unaligned) world coordinates.
+
+    exclude_mask: optional (S, H, W) bool — pixels to leave out of the fusion
+    (used to carve segmented objects out of the background mesh).
+    include_mask: optional (S, H, W) bool — restrict fusion to ONLY these
+    pixels (used for per-object high-resolution re-fusion from that object's
+    own SAM masks; frames with no masked pixels are skipped entirely).
+    bounds: optional (lower, upper) world-coordinate corners overriding the
+    automatic percentile fit — pairs with include_mask so a small object gets
+    a small, fine voxel grid instead of a slice of the room-sized coarse one.
+    """
     from skimage.measure import marching_cubes
-    from visual_util import depth_edge, apply_scene_alignment, integrate_camera_into_scene
+    from visual_util import depth_edge
 
     depth_map  = predictions["depth"]                       # (S, H, W, 1)
     depth_conf = predictions["depth_conf"]                  # (S, H, W)
@@ -105,6 +126,10 @@ def fuse_tsdf(
     conf = depth_conf.copy()
     if config.filter_depth_edges:
         conf[depth_edge(depth_map[..., 0], rtol=config.depth_edge_rtol)] = 0.0
+    if exclude_mask is not None:
+        conf[exclude_mask] = 0.0
+    if include_mask is not None:
+        conf[~include_mask] = 0.0
 
     valid = np.isfinite(conf) & (conf > 1e-5)
     conf_threshold = float(np.percentile(conf[valid], config.conf_percentile)) if valid.any() and config.conf_percentile > 0 else 0.0
@@ -115,10 +140,14 @@ def fuse_tsdf(
         raise ValueError("Too few valid points — try lowering the confidence threshold.")
 
     # ── Voxel grid geometry ───────────────────────────────────────────────────
-    lower = np.percentile(valid_pts, 2,  axis=0)
-    upper = np.percentile(valid_pts, 98, axis=0)
-    pad   = (upper - lower) * 0.05
-    lower -= pad;  upper += pad
+    if bounds is not None:
+        lower = np.asarray(bounds[0], dtype=np.float64).copy()
+        upper = np.asarray(bounds[1], dtype=np.float64).copy()
+    else:
+        lower = np.percentile(valid_pts, 2,  axis=0)
+        upper = np.percentile(valid_pts, 98, axis=0)
+        pad   = (upper - lower) * 0.05
+        lower -= pad;  upper += pad
 
     extent       = float(np.linalg.norm(upper - lower))
     voxel_length = extent / max(config.auto_resolution, 1)
@@ -126,7 +155,7 @@ def fuse_tsdf(
 
     dims = np.maximum(((upper - lower) / voxel_length).astype(int) + 2, 2)
     # Cap to avoid OOM on large scenes
-    max_dim = 192
+    max_dim = config.max_dim
     if dims.max() > max_dim:
         dims = np.maximum((dims * max_dim / dims.max()).astype(int), 2)
         voxel_length = float(np.max((upper - lower) / (dims - 1)))
@@ -148,6 +177,9 @@ def fuse_tsdf(
 
     # ── Per-frame TSDF integration (vectorised over voxels) ───────────────────
     for i in range(S):
+        # Object re-fusion touches a handful of frames; skip the rest outright.
+        if include_mask is not None and not include_mask[i].any():
+            continue
         K   = intrinsic[i]
         ext = extrinsic[i]                       # (3, 4) world-to-cam
 
@@ -156,10 +188,17 @@ def fuse_tsdf(
 
         u = K[0, 0] * cam[:, 0] / np.where(z > 0, z, 1) + K[0, 2]
         v = K[1, 1] * cam[:, 1] / np.where(z > 0, z, 1) + K[1, 2]
+        # The z>0 guard above only protects the division. A degenerate camera
+        # estimate can still produce NaN/Inf, while a tiny positive z can
+        # produce a finite projection too large to represent as int32. Map
+        # both cases to small, safely-castable out-of-view sentinels before
+        # rounding; the in_view mask below then rejects them normally.
+        u = np.clip(np.where(np.isfinite(u), u, -1.0), -1.0, float(W))
+        v = np.clip(np.where(np.isfinite(v), v, -1.0), -1.0, float(H))
         ui = np.round(u).astype(np.int32)
         vi = np.round(v).astype(np.int32)
 
-        in_view = (z > 0) & (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
+        in_view = np.isfinite(z) & (z > 0) & (ui >= 0) & (ui < W) & (vi >= 0) & (vi < H)
         if not in_view.any():
             continue
 
@@ -209,12 +248,27 @@ def fuse_tsdf(
     if len(components) > 1:
         mesh = max(components, key=lambda m: len(m.faces))
 
+    return mesh
+
+
+def fuse_tsdf(
+    predictions: dict,
+    config: TSDFConfig,
+    show_cam: bool = False,
+) -> trimesh.Scene:
+    """TSDF fusion → aligned trimesh.Scene (what the Gradio viewer consumes)."""
+    from visual_util import apply_scene_alignment, integrate_camera_into_scene
+
+    mesh = fuse_tsdf_raw_mesh(predictions, config)
+    extrinsic = predictions["extrinsic"]
+    S = extrinsic.shape[0]
+
     # ── Scene assembly + alignment ────────────────────────────────────────────
     extrinsics_4x4                  = np.zeros((S, 4, 4), dtype=np.float64)
     extrinsics_4x4[:, :3, :4]       = extrinsic
     extrinsics_4x4[:, 3, 3]         = 1.0
 
-    scene_scale = float(np.linalg.norm(upper - lower))
+    scene_scale = float(np.linalg.norm(mesh.bounds[1] - mesh.bounds[0]))
     if scene_scale <= 0:
         scene_scale = 1.0
 

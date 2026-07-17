@@ -1,0 +1,1123 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Room3D — Scene Editor & BMS Inspector</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root { --bg:#0d1117; --panel:#161b22; --border:#30363d; --text:#e6edf3;
+          --dim:#8b949e; --accent:#58a6ff; --ok:#3fb950; --err:#f85149; }
+  * { box-sizing: border-box; }
+  html, body { width:100%; height:100%; }
+  body { margin:0; font:13px/1.45 -apple-system, "Segoe UI", sans-serif;
+         background:var(--bg); color:var(--text); overflow:hidden; }
+  #app { display:grid; grid-template-columns:280px 1fr; height:100vh; height:100dvh;
+         min-height:0; }
+  #sidebar { background:var(--panel); border-right:1px solid var(--border);
+             display:flex; flex-direction:column; min-width:0; min-height:0;
+             /* Scroll the whole sidebar when the embed is too short for the
+                panels' min-heights, so the inspector + action buttons stay
+                reachable instead of being clipped by overflow:hidden. */
+             overflow-y:auto; overscroll-behavior:contain; }
+  #sidebar h1 { font-size:15px; margin:0; padding:14px 14px 4px; }
+  #scene-meta { padding:0 14px 10px; color:var(--dim); font-size:12px;
+                border-bottom:1px solid var(--border); }
+  .badge { display:inline-block; padding:1px 7px; border-radius:10px; font-size:11px;
+           background:#1f6feb33; color:var(--accent); margin-left:6px; }
+  .badge.ok { background:#23863633; color:var(--ok); }
+  #objlist { flex:1 1 auto; min-height:72px; overflow-y:auto;
+             overscroll-behavior:contain; padding:6px; }
+  .obj-row { padding:7px 9px; border-radius:6px; cursor:pointer; display:flex;
+             justify-content:space-between; align-items:baseline; gap:6px; }
+  .obj-row:hover, .obj-row.hovered { background:#21262d; }
+  .obj-row.selected { background:#1f6feb33; outline:1px solid var(--accent); }
+  .obj-row .lbl { font-weight:600; text-transform:capitalize; white-space:nowrap;
+                  overflow:hidden; text-overflow:ellipsis; }
+  .obj-row .dims { color:var(--dim); font-size:11px; white-space:nowrap; }
+  #inspector { border-top:1px solid var(--border); padding:12px 14px; font-size:12px;
+               /* min-height keeps the inspector visible instead of flex-
+                  collapsing to 0 in a short embed; the sidebar scrolls to it. */
+               flex:0 1 auto; min-height:120px; max-height:50%; overflow-y:auto;
+               overscroll-behavior:contain; color:var(--dim); background:#11151c; }
+  #inspector b { color:var(--text); text-transform:capitalize; }
+  #obj-label-input { width:100%; margin:0 0 8px; padding:6px 8px; color:var(--text);
+               background:#21262d; border:1px solid var(--border); border-radius:6px;
+               font:600 13px/1.3 -apple-system, "Segoe UI", sans-serif; }
+  #obj-label-input:focus { outline:none; border-color:var(--accent); }
+  #inspector img.obj-photo { display:block; width:100%; height:auto; max-height:240px;
+               object-fit:contain; object-position:left center; margin:8px 0 6px;
+               border-radius:6px; border:1px solid var(--border); background:var(--bg); }
+  #obj-actions { display:none; gap:6px; padding:8px 14px; border-top:1px solid var(--border); }
+  #obj-actions.visible { display:flex; }
+  #obj-actions button { flex:1; background:#21262d; color:var(--text); border:1px solid var(--border);
+             border-radius:6px; padding:6px 8px; cursor:pointer; font-size:11px; font-weight:500; }
+  #obj-actions button:hover { border-color:var(--accent); }
+  #obj-actions button.danger:hover { border-color:var(--err); color:var(--err); }
+  #viewport { position:relative; min-width:0; }
+  #toolbar { position:absolute; top:12px; left:12px; z-index:10; display:flex; gap:8px;
+             /* Wrap to multiple rows in a narrow embed so no control (e.g. Save
+                layout) overflows off-screen. max-width keeps it snug to its
+                content when it fits. */
+             flex-wrap:wrap; max-width:calc(100% - 24px);
+             background:var(--panel); border:1px solid var(--border); border-radius:8px;
+             padding:6px 8px; align-items:center; box-shadow:0 4px 12px rgba(0,0,0,0.3); }
+  #toolbar button { background:#21262d; color:var(--text); border:1px solid var(--border);
+             border-radius:6px; padding:5px 12px; cursor:pointer; font-size:12px; font-weight:500; }
+  #toolbar button:hover { border-color:var(--accent); }
+  #toolbar button.active { background:#1f6feb; border-color:#1f6feb; color:#fff; }
+  #toolbar button.primary { background:#238636; border-color:#238636; color:#fff; }
+  #toolbar label { display:flex; gap:4px; align-items:center; color:var(--dim);
+                   font-size:12px; cursor:pointer; font-weight:500; }
+  #toolbar select { background:#21262d; color:var(--text); border:1px solid var(--border);
+                    border-radius:6px; padding:4px 7px; font-size:12px; }
+  #toast { position:absolute; bottom:16px; left:50%; transform:translateX(-50%);
+           background:var(--panel); border:1px solid var(--border); border-radius:8px;
+           padding:8px 16px; opacity:0; transition:opacity .3s; pointer-events:none; z-index:100;
+           box-shadow:0 4px 12px rgba(0,0,0,0.4); font-weight:500; }
+  #help { position:absolute; bottom:12px; right:14px; color:var(--dim); font-size:11px;
+          text-align:right; pointer-events:none; line-height:1.5; }
+  #hover-tip { position:absolute; z-index:20; pointer-events:none; display:none;
+               background:var(--panel); border:1px solid var(--accent); border-radius:6px;
+               padding:4px 10px; font-size:12px; white-space:nowrap;
+               box-shadow:0 4px 12px rgba(0,0,0,0.4); }
+  #hover-tip .lbl { font-weight:600; text-transform:capitalize; }
+  #hover-tip .dims { color:var(--dim); margin-left:6px; }
+  canvas { display:block; }
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="sidebar">
+    <h1>Room3D BMS Editor</h1>
+    <div id="scene-meta">Loading…</div>
+    <div id="objlist"></div>
+    <div id="obj-actions">
+      <button id="btn-regen" title="Regenerate this object's mesh with TRELLIS.2 image-to-3D from its detected view">Regenerate ✨</button>
+      <button id="btn-replace-model" title="Replace this object's mesh with an uploaded GLB, auto-fit to its detected size">Replace Model…</button>
+      <button id="btn-delete-obj" class="danger" title="Remove this object from the scene">Delete</button>
+      <input type="file" id="file-model-upload" accept=".glb" style="display:none;" />
+    </div>
+    <div id="inspector">Click an object to select it.</div>
+  </div>
+  <div id="viewport">
+    <div id="toolbar">
+      <button id="btn-move" class="active" title="Move (G)">Move</button>
+      <button id="btn-rotate" title="Rotate (R)">Rotate</button>
+      <button id="btn-camera" title="Toggle Orthographic Top-Down Blueprint (C)">3D Perspective</button>
+      <button id="btn-measure" title="Measure Distance (D)">Measure</button>
+      <label title="Compare the editable scene against the aligned VGGT scan">View
+        <select id="view-mode">
+          <option value="structured">Structured</option>
+          <option value="raw">Raw Scan</option>
+          <option value="both">Both</option>
+        </select>
+      </label>
+      <label title="Snap moves to 0.1 m and rotations to 15°"><input type="checkbox" id="chk-snap" />Snap</label>
+      <label><input type="checkbox" id="chk-floor" checked />Lock to floor</label>
+      <label><input type="checkbox" id="chk-labels" checked />Labels</label>
+      <label><input type="checkbox" id="chk-heatmap" />Thermal Heatmap</label>
+      <label><input type="checkbox" id="chk-walls" checked />Room Transparent</label>
+      <button id="btn-save" class="primary">Save layout</button>
+    </div>
+    <div id="help">
+      G Move · R Rotate · C Cam · D Measure · Esc Deselect<br/>
+      drag: orbit/pan · wheel: zoom · hover: inspect · click: select object
+    </div>
+    <div id="hover-tip"></div>
+    <div id="toast"></div>
+  </div>
+</div>
+
+<script type="importmap">
+{ "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+} }
+</script>
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { TransformControls } from 'three/addons/controls/TransformControls.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
+
+const sceneName = new URLSearchParams(location.search).get('scene');
+// Per-build cache-bust token (threaded from _build_editor_update's iframe src,
+// falls back to now). scene.json / background.glb / raw_scan.glb are otherwise
+// fetched at a stable URL, so a rebuilt scene could be served stale from cache.
+const cacheBust = new URLSearchParams(location.search).get('v') || Date.now();
+const $ = (id) => document.getElementById(id);
+const unit = { m: 'm', u: 'u' };
+let units = 'm';
+const escapeHtml = (value) => String(value).replace(/[&<>'"]/g, (ch) => ({
+  '&': '&amp;', '<': '&lt;', '>': '&gt;', "'": '&#39;', '"': '&quot;',
+}[ch]));
+
+if (!sceneName) {
+  $('scene-meta').textContent = 'No scene specified — open this page as /editor/?scene=<name>';
+  throw new Error('no scene');
+}
+
+// ── Scene data + sidebar setup ───────────────────────────────────────────────
+const base = `/scenes/${sceneName}/`;
+const res = await fetch(base + 'scene.json?v=' + cacheBust);
+if (!res.ok) {
+  $('scene-meta').textContent = `Scene "${sceneName}" not found.`;
+  throw new Error('scene not found');
+}
+const sceneData = await res.json();
+units = sceneData.metric ? 'm' : 'u';
+
+// Show a second decimal on dimensions that would otherwise round to 0.0.
+const fmtDim = (v) => (Math.abs(v) < 0.095 ? v.toFixed(2) : v.toFixed(1));
+
+const labelReview = sceneData.label_review;
+const labelReviewMeta = labelReview?.enabled
+  ? `<br/>Gemini reviewed ${labelReview.reviewed || 0} · relabeled ${labelReview.relabeled || 0} · rejected ${labelReview.rejected || 0}`
+  : '';
+$('scene-meta').innerHTML =
+  `<b>${sceneData.name}</b>` +
+  `<span class="badge ${sceneData.metric ? 'ok' : ''}">${sceneData.metric ? 'metric (calibrated)' : 'relative scale'}</span><br/>` +
+  `Room: ${[sceneData.room.width, sceneData.room.depth, sceneData.room.height].map(fmtDim).join('×')} ${unit[units]} · ${sceneData.objects.length} objects` +
+  labelReviewMeta;
+
+const listEl = $('objlist');
+for (const obj of sceneData.objects) {
+  const row = document.createElement('div');
+  row.className = 'obj-row';
+  row.id = 'row-' + obj.id;
+  row.innerHTML = `<span class="lbl">${escapeHtml(obj.label)}</span>` +
+    `<span class="dims">${obj.size.map(fmtDim).join('×')}${unit[units]}</span>`;
+  row.onclick = () => select(obj.id);
+  row.onpointerenter = () => onRowHover3D?.(obj.id);
+  row.onpointerleave = () => onRowHover3D?.(null);
+  listEl.appendChild(row);
+}
+let onRowHover3D = null;          // wired up once the 3D scene exists
+
+// ── Selection state + inspector (works with or without WebGL) ────────────────
+const byId = new Map(sceneData.objects.map((o) => [o.id, o]));
+const objectGroups = new Map();   // id → THREE.Group (stays empty without WebGL)
+const hoverBoxes = new Map();     // id → bounding-box outline (child of the group)
+const labelSprites = [];
+let selectedId = null;
+let onSelect3D = null;            // wired up once the 3D scene exists
+
+function select(id) {
+  if (selectedId) $('row-' + selectedId)?.classList.remove('selected');
+  selectedId = id;
+  if (onSelect3D) onSelect3D(id);
+  if (id) {
+    const row = $('row-' + id);
+    if (row) {
+      row.classList.add('selected');
+      row.scrollIntoView({ block: 'nearest' });
+    }
+  }
+  $('obj-actions').classList.toggle('visible', !!id);
+  refreshInspector();
+}
+
+function refreshInspector() {
+  const el = $('inspector');
+  if (!selectedId) { el.textContent = 'Click an object to select it.'; return; }
+  const o = byId.get(selectedId);
+  const g = objectGroups.get(selectedId);
+  const p = g ? g.position : { x: o.position[0], y: o.position[1], z: o.position[2] };
+  const yaw = g ? -g.rotation.y : o.yaw;
+  const quality = o.scan_quality;
+  const qualityLine = quality
+    ? `<br/>scan support ${(quality.support * 100).toFixed(0)}% · quality ${(quality.score * 100).toFixed(0)}%`
+    : '';
+  const reviewLine = o.original_label
+    ? `<br/>Gemini relabeled “${escapeHtml(o.original_label)}”` +
+      (o.label_review ? ` · ${(o.label_review.confidence * 100).toFixed(0)}% confidence` : '')
+    : '';
+
+  el.innerHTML =
+    `<input id="obj-label-input" value="${escapeHtml(o.label)}" maxlength="100" ` +
+      `aria-label="Object label" title="Edit this object's label, then save the layout" />` +
+    `<span class="badge">${escapeHtml(o.source)}</span><br/>` +
+    (o.photo ? `<img class="obj-photo" src="${base + o.photo}" alt="detected ${escapeHtml(o.label)}" ` +
+               `title="Source photo this object was detected in" />` : '') +
+    `size ${o.size.map((v) => v.toFixed(2)).join(' × ')} ${unit[units]}<br/>` +
+    `pos (${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}) ${unit[units]} · ` +
+    `yaw ${(yaw * 180 / Math.PI).toFixed(0)}°<br/>` +
+    `detected ${(o.score * 100).toFixed(0)}% · seen in ${o.frames_seen} frame(s)` +
+    qualityLine + reviewLine;
+
+  const labelInput = $('obj-label-input');
+  labelInput.addEventListener('input', () => {
+    o.label = labelInput.value;
+    const rowLabel = $('row-' + o.id)?.querySelector('.lbl');
+    if (rowLabel) rowLabel.textContent = o.label || 'Untitled';
+  });
+  labelInput.addEventListener('change', () => {
+    o.label = labelInput.value.trim();
+    labelInput.value = o.label;
+    updateObjectLabelSprite(o);
+  });
+  labelInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') labelInput.blur();
+  });
+}
+
+window.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && e.target.tagName !== 'INPUT') select(null);
+});
+
+// ── Renderer / scene setup ────────────────────────────────────────────────────
+const viewport = $('viewport');
+let renderer;
+try {
+  renderer = new THREE.WebGLRenderer({ antialias: true });
+} catch (err) {
+  const msg = document.createElement('div');
+  msg.style.cssText = 'position:absolute;inset:0;display:flex;align-items:center;' +
+    'justify-content:center;color:#8b949e;font-size:14px;padding:40px;text-align:center;';
+  msg.textContent = 'WebGL is not available in this browser — the object list on the ' +
+    'left is live, but the 3D view needs a WebGL-capable browser.';
+  viewport.appendChild(msg);
+  $('btn-save').disabled = true;
+  throw err;
+}
+renderer.setPixelRatio(window.devicePixelRatio);
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+// ACES + sRGB output: filmic rolloff instead of clipped highlights. Slight
+// exposure lift compensates for ACES darkening mid-tones — the scan textures
+// are already dim indoor footage.
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1.15;
+renderer.outputColorSpace = THREE.SRGBColorSpace;
+viewport.appendChild(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x0d1117);
+
+// Image-based ambient: soft directional variation on every surface instead of
+// the flat wash a hemisphere light alone gives.
+const pmrem = new THREE.PMREMGenerator(renderer);
+scene.environment = pmrem.fromScene(new RoomEnvironment(renderer), 0.04).texture;
+
+// Dual cameras setup: Perspective (3D) & Orthographic (2D Blueprint)
+const camera = new THREE.PerspectiveCamera(55, 1, 0.05, 500);
+camera.position.set(5, 4, 7);
+
+const ext = Math.max(sceneData.room.width, sceneData.room.depth, 4);
+const orthoCamera = new THREE.OrthographicCamera(-ext/2, ext/2, ext/2, -ext/2, 0.05, 500);
+orthoCamera.position.set(0, 15, 0);
+orthoCamera.lookAt(0, 0, 0);
+
+// Environment map above carries most of the ambient now — hemisphere just
+// lifts the floor bounce a little.
+scene.add(new THREE.HemisphereLight(0xffffff, 0x334455, 0.5));
+const dir = new THREE.DirectionalLight(0xffffff, 1.1);
+dir.position.set(ext * 0.5, ext * 0.9, ext * 0.4);
+dir.castShadow = true;
+dir.shadow.mapSize.set(2048, 2048);
+dir.shadow.camera.left = -ext; dir.shadow.camera.right = ext;
+dir.shadow.camera.top = ext; dir.shadow.camera.bottom = -ext;
+dir.shadow.camera.near = 0.1; dir.shadow.camera.far = ext * 4;
+dir.shadow.bias = -0.0004;
+scene.add(dir);
+
+const orbit = new OrbitControls(camera, renderer.domElement);
+orbit.damping = true;
+orbit.zoomSpeed = 2.5;
+
+const orthoOrbit = new OrbitControls(orthoCamera, renderer.domElement);
+orthoOrbit.damping = true;
+orthoOrbit.zoomSpeed = 2.5;
+orthoOrbit.enableRotate = false; // Lock rotation in 2D Floorplan blueprint view
+orthoOrbit.target.set(0, 0, 0);
+
+let activeCamera = camera;
+let activeOrbit = orbit;
+
+const gizmo = new TransformControls(camera, renderer.domElement);
+gizmo.addEventListener('dragging-changed', (e) => { activeOrbit.enabled = !e.value; });
+gizmo.addEventListener('objectChange', () => { 
+  if (selectedId) {
+    if ($('chk-floor').checked) {
+      objectGroups.get(selectedId).position.y = 0.0; // Snap bottom to leveled floor
+    }
+    checkCollisions();
+    refreshInspector(); 
+  }
+});
+scene.add(gizmo);
+
+function resize() {
+  const w = viewport.clientWidth, h = viewport.clientHeight;
+  renderer.setSize(w, h);
+  
+  camera.aspect = w / h;
+  camera.updateProjectionMatrix();
+
+  const aspect = w / h;
+  orthoCamera.left = -ext * aspect * 0.55;
+  orthoCamera.right = ext * aspect * 0.55;
+  orthoCamera.top = ext * 0.55;
+  orthoCamera.bottom = -ext * 0.55;
+  orthoCamera.updateProjectionMatrix();
+}
+window.addEventListener('resize', resize);
+
+// ── State ─────────────────────────────────────────────────────────────────────
+const loader = new GLTFLoader();
+
+function toast(msg, ms = 2500) {
+  const t = $('toast');
+  t.innerHTML = msg;
+  t.style.opacity = 1;
+  clearTimeout(t._h);
+  t._h = setTimeout(() => (t.style.opacity = 0), ms);
+}
+
+function makeLabel(text, size) {
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d');
+  ctx.font = '600 44px -apple-system, sans-serif';
+  const w = Math.ceil(ctx.measureText(text).width) + 40;
+  canvas.width = w; canvas.height = 72;
+  const c2 = canvas.getContext('2d');
+  c2.fillStyle = 'rgba(13,17,23,0.85)';
+  c2.beginPath(); c2.roundRect(0, 0, w, 72, 16); c2.fill();
+  c2.font = '600 44px -apple-system, sans-serif';
+  c2.fillStyle = '#e6edf3';
+  c2.textAlign = 'center'; c2.textBaseline = 'middle';
+  c2.fillText(text, w / 2, 38);
+  const tex = new THREE.CanvasTexture(canvas);
+  tex.colorSpace = THREE.SRGBColorSpace;
+  // toneMapped: false — labels are UI, not scene; ACES would dim them.
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, toneMapped: false }));
+  // Scale relative to the object's own size, not a fixed absolute size — a
+  // label sized for a 2m rack would dwarf a detected object a few cm across.
+  const s = Math.min(Math.max(Math.max(...size) * 0.3, 0.02), 0.4);
+  sprite.scale.set((w / 72) * s, s, 1);
+  sprite.position.y = size[1] + s * 0.7;
+  sprite.renderOrder = 999;
+  labelSprites.push(sprite);
+  return sprite;
+}
+
+function updateObjectLabelSprite(obj) {
+  const group = objectGroups.get(obj.id);
+  if (!group || !obj.label) return;
+  const old = group.userData.labelSprite;
+  if (old) {
+    group.remove(old);
+    const i = labelSprites.indexOf(old);
+    if (i >= 0) labelSprites.splice(i, 1);
+    old.material.map?.dispose();
+    old.material.dispose();
+  }
+  const sprite = makeLabel(obj.label, obj.size);
+  sprite.visible = $('chk-labels').checked;
+  group.userData.labelSprite = sprite;
+  group.add(sprite);
+}
+
+// Helper to calculate stable deterministic mock temperatures
+function getObjectTemperature(id) {
+  const h = [...id].reduce((acc, c) => acc + c.charCodeAt(0), 0);
+  return 19.5 + (h % 9) * 1.3;  // Stable mock temperature in range [19.5, 30.0] °C
+}
+
+// ── Load geometry ─────────────────────────────────────────────────────────────
+// background/floor/ceiling/wall_* are separate named meshes server-side (each
+// has its own baked texture, so they can't be merged into one mesh without
+// losing that), but behave as a single "room" object here — solid by
+// default, with a transparency toggle so the walls don't block the view of
+// the room's interior.
+const roomMaterials = [];
+let structuredRoom = null;
+let rawScan = null;
+loader.load(base + 'background.glb?v=' + cacheBust, (g) => {
+  g.scene.traverse((n) => {
+    if (n.isMesh) {
+      n.material.side = THREE.DoubleSide;
+      // Older exports omitted metallicFactor, which glTF defaults to 1.0
+      // (fully metallic → near-black diffuse). Force non-metal on load so
+      // scenes built before the exporter fix render correctly too.
+      if ('metalness' in n.material) n.material.metalness = 0;
+      // Room receives object shadows but casts none: walls/ceiling casting
+      // room-wide shadows just darkens everything, and looks wrong when the
+      // room is toggled transparent.
+      n.receiveShadow = true;
+      if (/^(background|floor(?:_fill)?|ceiling(?:_fill)?|wall_\d+(?:_fill)?)$/.test(n.name)) {
+        roomMaterials.push(n.material);
+      }
+    }
+  });
+  structuredRoom = g.scene;
+  scene.add(structuredRoom);
+  applyRoomTransparency($('chk-walls').checked);
+  applyViewMode();
+});
+
+function applyRoomTransparency(transparent) {
+  roomMaterials.forEach((m) => {
+    m.transparent = transparent;
+    m.opacity = transparent ? 0.25 : 1.0;
+    m.depthWrite = !transparent;  // avoid transparent sort artifacts hiding objects behind
+  });
+}
+
+const grid = new THREE.GridHelper(
+  Math.max(sceneData.room.width, sceneData.room.depth) * 1.6, 24, 0x30363d, 0x21262d);
+grid.position.y = -0.02;
+scene.add(grid);
+
+const viewModeSelect = $('view-mode');
+viewModeSelect.value = sceneData.raw_scan ? 'both' : 'structured';
+if (!sceneData.raw_scan) {
+  viewModeSelect.querySelector('option[value="raw"]').disabled = true;
+  viewModeSelect.querySelector('option[value="both"]').disabled = true;
+  viewModeSelect.title = 'Rebuild this scene to generate a raw-scan overlay.';
+} else {
+  loader.load(base + sceneData.raw_scan + '?v=' + cacheBust, (g) => {
+    rawScan = g.scene;
+    rawScan.name = 'raw-scan-overlay';
+    rawScan.traverse((n) => {
+      if (n.isPoints) {
+        n.material.size = Math.max(Math.max(sceneData.room.width, sceneData.room.depth) * 0.0015, 0.008);
+        n.material.sizeAttenuation = true;
+        n.material.vertexColors = true;
+        n.material.toneMapped = false;
+        n.material.needsUpdate = true;
+      }
+    });
+    scene.add(rawScan);
+    applyViewMode();
+  }, undefined, () => {
+    viewModeSelect.value = 'structured';
+    toast('Raw scan overlay could not be loaded.');
+    applyViewMode();
+  });
+}
+
+function applyViewMode() {
+  const selected = viewModeSelect.value;
+  const showStructured = selected !== 'raw';
+  const showRaw = selected !== 'structured';
+  if (structuredRoom) structuredRoom.visible = showStructured;
+  if (rawScan) rawScan.visible = showRaw;
+  grid.visible = showStructured;
+  for (const group of objectGroups.values()) group.visible = showStructured;
+  if (!showStructured) {
+    gizmo.detach();
+  } else if (selectedId && !isOrtho && !isMeasuring) {
+    gizmo.attach(objectGroups.get(selectedId));
+  }
+}
+viewModeSelect.onchange = applyViewMode;
+
+for (const obj of sceneData.objects) {
+  const group = new THREE.Group();
+  group.name = obj.id;
+  group.position.fromArray(obj.position);
+  group.rotation.y = -obj.yaw;
+  group.userData.object = obj;
+  scene.add(group);
+  objectGroups.set(obj.id, group);
+
+  // Yaw-oriented bounding-box outline, shown on hover. A child of the group,
+  // so it follows moves/rotations for free. Origin is bottom-centre → lift h/2.
+  const boxOutline = new THREE.LineSegments(
+    new THREE.EdgesGeometry(new THREE.BoxGeometry(...obj.size)),
+    new THREE.LineBasicMaterial({ color: 0x58a6ff, transparent: true, opacity: 0.95, depthTest: false })
+  );
+  boxOutline.position.y = obj.size[1] / 2;
+  boxOutline.visible = false;
+  boxOutline.renderOrder = 998;
+  boxOutline.raycast = () => {};   // lines have a fat pick threshold — never hover-pick the box itself
+  group.add(boxOutline);
+  hoverBoxes.set(obj.id, boxOutline);
+
+  const labelSprite = makeLabel(obj.label, obj.size);
+  group.userData.labelSprite = labelSprite;
+  group.add(labelSprite);
+
+  loadObjectMesh(obj, group);
+}
+
+// Each object's loaded mesh lives in its own sub-group (scaled independently
+// of the label/hover-box siblings) so a replacement upload can be scaled to
+// fit the detected size without distorting those. Re-callable: swaps the mesh
+// in place, used both for the initial load and for "Replace Model".
+const meshContainers = new Map();
+function loadObjectMesh(obj, group) {
+  const s = obj.model_scale || [1, 1, 1];
+  const o = obj.model_offset || [0, 0, 0];
+  loader.load(base + obj.glb + '?t=' + Date.now(), (g) => {  // cache-bust: same URL can change after a replace
+    const old = meshContainers.get(obj.id);
+    if (old) {
+      group.remove(old);
+      old.traverse((n) => {
+        if (n.isMesh) { n.geometry?.dispose(); n.material?.dispose(); }
+      });
+    }
+    g.scene.position.set(o[0], o[1], o[2]);
+    const container = new THREE.Group();
+    container.scale.set(s[0], s[1], s[2]);
+    container.add(g.scene);
+    group.add(container);
+    meshContainers.set(obj.id, container);
+
+    // Save original vertex colors for restoration
+    g.scene.traverse((child) => {
+      if (child.isMesh) {
+        child.castShadow = true;
+        child.receiveShadow = true;
+        if (child.material) {
+          // Same metallicFactor-default fix as the room mesh (see above).
+          if ('metalness' in child.material) child.material.metalness = 0;
+          child.userData.originalColor = child.material.color ? child.material.color.clone() : new THREE.Color(0xffffff);
+        }
+      }
+    });
+  }, undefined, () => toast(`Failed to load ${obj.id}`));
+}
+
+// Frame the room
+camera.position.set(ext * 0.7, ext * 0.55, ext * 0.9);
+orbit.target.set(0, sceneData.room.height ? sceneData.room.height * 0.3 : 1, 0);
+resize();
+
+// ── Selection (3D side — DOM/inspector half lives above, WebGL-independent) ──
+function setEmissive(group, on) {
+  group.traverse((n) => {
+    if (n.isMesh && n.material && 'emissive' in n.material) {
+      n.material.emissive = new THREE.Color(on ? 0x2255aa : 0x000000);
+      n.material.emissiveIntensity = on ? 0.6 : 0;
+    }
+  });
+}
+
+let lastSelected3D = null;
+onSelect3D = (id) => {
+  if (lastSelected3D && objectGroups.has(lastSelected3D)) {
+    setEmissive(objectGroups.get(lastSelected3D), false);
+    // Deselected while still hovered → fall back to the hover tint
+    if (hoveredId === lastSelected3D)
+      setHoverEmissive(objectGroups.get(lastSelected3D), true);
+  }
+  lastSelected3D = id;
+  if (!id) { gizmo.detach(); return; }
+  const group = objectGroups.get(id);
+  if (!group) return;
+  setEmissive(group, true);
+  if (!isOrtho && !isMeasuring) {
+    gizmo.attach(group);
+  }
+  applyMode();
+};
+
+// ── Collision / Bounding Box Overlap System ──────────────────────────────────
+function checkCollisions() {
+  if (!selectedId) return;
+  const activeObj = objectGroups.get(selectedId);
+  
+  // Calculate raw box boundaries
+  const activeBox = new THREE.Box3().setFromObject(activeObj);
+  let collision = false;
+
+  for (const [id, obj] of objectGroups.entries()) {
+    if (id === selectedId) continue;
+    const otherBox = new THREE.Box3().setFromObject(obj);
+    if (activeBox.intersectsBox(otherBox)) {
+      collision = true;
+      break;
+    }
+  }
+
+  // Turn red on collision, else restore
+  activeObj.traverse((child) => {
+    if (child.isMesh && child.material) {
+      if (collision) {
+        child.material.color.setHex(0xff0000); // Red alert coloring
+      } else {
+        // Restore color (re-evaluating thermal/original)
+        const heatmapOn = $('chk-heatmap').checked;
+        if (heatmapOn) {
+          applyThermalColor(objectGroups.get(selectedId));
+        } else {
+          child.material.color.copy(child.userData.originalColor || new THREE.Color(0xffffff));
+        }
+      }
+    }
+  });
+
+  if (collision) {
+    toast('⚠️ <span style="color:var(--err);">Collision Warning: Object bounding boxes are overlapping!</span>');
+  }
+}
+
+// ── BMS Thermal Heatmap material overlay ──────────────────────────────────────
+function applyThermalColor(group) {
+  const temp = getObjectTemperature(group.name);
+  // Color interpolates from Blue (19.5 °C) to Red (30.0 °C)
+  const t = Math.min(Math.max((temp - 19.5) / 10.5, 0), 1);
+  const color = new THREE.Color();
+  color.setRGB(t, 0.15, 1.0 - t); // Heat map color-scale
+  
+  group.traverse((child) => {
+    if (child.isMesh && child.material) {
+      child.material.color.copy(color);
+    }
+  });
+}
+
+function updateHeatmapOverlay() {
+  const active = $('chk-heatmap').checked;
+  for (const [id, group] of objectGroups.entries()) {
+    if (active) {
+      applyThermalColor(group);
+    } else {
+      group.traverse((child) => {
+        if (child.isMesh && child.material) {
+          child.material.color.copy(child.userData.originalColor || new THREE.Color(0xffffff));
+        }
+      });
+    }
+  }
+  if (selectedId) checkCollisions();
+}
+$('chk-heatmap').onchange = updateHeatmapOverlay;
+
+// ── Raycasting Pointer selection ──────────────────────────────────────────────
+const ray = new THREE.Raycaster();
+const ptr = new THREE.Vector2();
+
+// Topmost object group under the cursor (ignores label sprites), or null.
+function pickObject(e) {
+  if (viewModeSelect.value === 'raw') return null;
+  const r = renderer.domElement.getBoundingClientRect();
+  ptr.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+  ray.setFromCamera(ptr, activeCamera);
+  const hits = ray.intersectObjects([...objectGroups.values()], true);
+  for (const h of hits) {
+    if (h.object.isSprite) continue;
+    let n = h.object;
+    while (n && !objectGroups.has(n.name)) n = n.parent;
+    if (n) return n.name;
+  }
+  return null;
+}
+
+// ── Hover: bounding-box outline + label tooltip ──────────────────────────────
+const tip = $('hover-tip');
+let hoveredId = null;
+
+function setHoverEmissive(group, on) {
+  group.traverse((n) => {
+    if (n.isMesh && n.material && 'emissive' in n.material) {
+      n.material.emissive = new THREE.Color(on ? 0x58a6ff : 0x000000);
+      n.material.emissiveIntensity = on ? 0.25 : 0;
+    }
+  });
+}
+
+function setHover(id, showTip = true) {
+  if (id !== hoveredId) {
+    if (hoveredId) {
+      const hb = hoverBoxes.get(hoveredId);
+      if (hb) hb.visible = false;
+      // Don't clear the (stronger) selection highlight
+      if (hoveredId !== selectedId && objectGroups.has(hoveredId))
+        setHoverEmissive(objectGroups.get(hoveredId), false);
+      $('row-' + hoveredId)?.classList.remove('hovered');
+    }
+    hoveredId = id;
+    if (id) {
+      const hb = hoverBoxes.get(id);
+      if (hb) hb.visible = true;
+      if (id !== selectedId) setHoverEmissive(objectGroups.get(id), true);
+      $('row-' + id)?.classList.add('hovered');
+    }
+    renderer.domElement.style.cursor = id ? 'pointer' : '';
+  }
+  if (id && showTip) {
+    const o = byId.get(id);
+    tip.innerHTML = `<span class="lbl">${escapeHtml(o.label)}</span>` +
+      `<span class="dims">${o.size.map(fmtDim).join('×')}${unit[units]} · ${(o.score * 100).toFixed(0)}%</span>`;
+    tip.style.display = 'block';
+  } else {
+    tip.style.display = 'none';
+  }
+}
+
+renderer.domElement.addEventListener('pointermove', (e) => {
+  if (gizmo.dragging || isMeasuring) { setHover(null); return; }
+  setHover(pickObject(e));
+  if (hoveredId) {
+    const vr = viewport.getBoundingClientRect();
+    tip.style.left = (e.clientX - vr.left + 14) + 'px';
+    tip.style.top  = (e.clientY - vr.top + 14) + 'px';
+  }
+});
+renderer.domElement.addEventListener('pointerleave', () => setHover(null));
+onRowHover3D = (id) => setHover(id, false);   // sidebar hover: box only, no cursor tooltip
+
+renderer.domElement.addEventListener('pointerdown', (e) => {
+  if (e.button !== 0 || gizmo.dragging) return;
+  
+  if (isMeasuring) {
+    const r = renderer.domElement.getBoundingClientRect();
+    ptr.set(((e.clientX - r.left) / r.width) * 2 - 1, -((e.clientY - r.top) / r.height) * 2 + 1);
+    ray.setFromCamera(ptr, activeCamera);
+    
+    // Raycast scene to find physical ground/plane point
+    const hits = ray.intersectObjects(scene.children, true);
+    let clickPoint = null;
+    for (const h of hits) {
+      if (!h.object.isSprite) {
+        clickPoint = h.point;
+        break;
+      }
+    }
+    
+    if (clickPoint) {
+      measurePoints.push(clickPoint.clone());
+      
+      const sphereGeo = new THREE.SphereGeometry(0.06, 16, 16);
+      const sphereMat = new THREE.MeshBasicMaterial({ color: 0x3fb950 });
+      const marker = new THREE.Mesh(sphereGeo, sphereMat);
+      marker.position.copy(clickPoint);
+      scene.add(marker);
+      measureMarkers.push(marker);
+      
+      if (measurePoints.length === 1) {
+        toast('First point placed. Click another spot to measure the distance.');
+      } else if (measurePoints.length === 2) {
+        const p1 = measurePoints[0];
+        const p2 = measurePoints[1];
+        const dist = p1.distanceTo(p2);
+        
+        const lineMat = new THREE.LineBasicMaterial({ color: 0x3fb950, linewidth: 2 });
+        const lineGeo = new THREE.BufferGeometry().setFromPoints([p1, p2]);
+        const line = new THREE.Line(lineGeo, lineMat);
+        scene.add(line);
+        measureLine = line;
+        
+        const midPoint = new THREE.Vector3().addVectors(p1, p2).multiplyScalar(0.5);
+        midPoint.y += 0.15; // Float middle of ruler line
+        
+        measureLabel = createTextSprite(`${dist.toFixed(2)} m`);
+        measureLabel.position.copy(midPoint);
+        scene.add(measureLabel);
+        
+        toast(`📏 Distance: <strong style="color:var(--ok);">${dist.toFixed(2)} meters</strong>`);
+        
+        // Reset measurement mode
+        isMeasuring = false;
+        $('btn-measure').classList.remove('active');
+        viewport.style.cursor = 'default';
+        activeOrbit.enabled = true;
+        gizmo.enabled = !isOrtho;
+        if (selectedId && !isOrtho) gizmo.attach(objectGroups.get(selectedId));
+      }
+    }
+    return;
+  }
+
+  const id = pickObject(e);
+  if (id) select(id);
+});
+
+// ── Distance Measurement Tool math helpers ────────────────────────────────────
+let isMeasuring = false;
+let measurePoints = [];
+let measureMarkers = [];
+let measureLine = null;
+let measureLabel = null;
+
+function clearMeasurement() {
+  if (measureLine) { scene.remove(measureLine); measureLine = null; }
+  if (measureLabel) { scene.remove(measureLabel); measureLabel = null; }
+  measureMarkers.forEach(m => scene.remove(m));
+  measureMarkers = [];
+  measurePoints = [];
+}
+
+$('btn-measure').onclick = () => {
+  isMeasuring = !isMeasuring;
+  $('btn-measure').classList.toggle('active', isMeasuring);
+  if (isMeasuring) {
+    gizmo.detach();
+    gizmo.enabled = false;
+    activeOrbit.enabled = false;
+    viewport.style.cursor = 'crosshair';
+    clearMeasurement();
+    toast('📏 Measurement mode: Click on a surface to place the starting point.');
+  } else {
+    viewport.style.cursor = 'default';
+    activeOrbit.enabled = true;
+    gizmo.enabled = !isOrtho;
+    if (selectedId && !isOrtho) gizmo.attach(objectGroups.get(selectedId));
+    clearMeasurement();
+  }
+};
+
+function createTextSprite(text) {
+  const canvas = document.createElement('canvas');
+  canvas.width = 160;
+  canvas.height = 48;
+  const ctx = canvas.getContext('2d');
+  
+  // Slate background pill box
+  ctx.fillStyle = 'rgba(13,17,23,0.92)';
+  ctx.beginPath();
+  ctx.roundRect(0, 0, 160, 48, 12);
+  ctx.fill();
+  
+  // Neon Green border
+  ctx.strokeStyle = '#3fb950';
+  ctx.lineWidth = 2;
+  ctx.stroke();
+  
+  // Sharp distance value text
+  ctx.fillStyle = '#ffffff';
+  ctx.font = 'bold 22px monospace';
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillText(text, 80, 24);
+  
+  const tex = new THREE.CanvasTexture(canvas);
+  const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: tex, depthTest: false, toneMapped: false }));
+  sprite.scale.set(0.65, 0.2, 1);
+  sprite.renderOrder = 1000;
+  return sprite;
+}
+
+// ── Dual Camera (Perspective 3D / Ortho 2D Blueprint) Toggles ───────────────
+let isOrtho = false;
+$('btn-camera').onclick = () => {
+  isOrtho = !isOrtho;
+  if (isOrtho) {
+    activeCamera = orthoCamera;
+    activeOrbit = orthoOrbit;
+    $('btn-camera').textContent = '2D Floorplan';
+    $('btn-camera').classList.add('active');
+    
+    // De-attach gizmo in top-down mode for schematic reading
+    gizmo.detach();
+    gizmo.enabled = false;
+    
+    orthoCamera.position.set(0, 15, 0);
+    orthoOrbit.target.set(0, 0, 0);
+    orthoOrbit.update();
+    
+    toast('2D Blueprint blueprint mode: Locked top-down camera.');
+  } else {
+    activeCamera = camera;
+    activeOrbit = orbit;
+    $('btn-camera').textContent = '3D Perspective';
+    $('btn-camera').classList.remove('active');
+    
+    gizmo.enabled = true;
+    if (selectedId) gizmo.attach(objectGroups.get(selectedId));
+    
+    toast('3D Perspective viewport enabled.');
+  }
+  resize();
+};
+
+// ── Modes ─────────────────────────────────────────────────────────────────────
+let mode = 'translate';
+function applyMode() {
+  gizmo.setMode(mode);
+  if (mode === 'translate') {
+    const lock = $('chk-floor').checked;
+    gizmo.showX = true; gizmo.showZ = true; gizmo.showY = !lock;
+  } else {
+    gizmo.showX = false; gizmo.showZ = false; gizmo.showY = true;
+  }
+  $('btn-move').classList.toggle('active', mode === 'translate');
+  $('btn-rotate').classList.toggle('active', mode === 'rotate');
+}
+$('btn-move').onclick = () => { mode = 'translate'; applyMode(); };
+$('btn-rotate').onclick = () => { mode = 'rotate'; applyMode(); };
+$('chk-floor').onchange = applyMode;
+function applySnap() {
+  const on = $('chk-snap').checked;
+  gizmo.setTranslationSnap(on ? 0.1 : null);
+  gizmo.setRotationSnap(on ? THREE.MathUtils.degToRad(15) : null);
+}
+$('chk-snap').onchange = applySnap;
+applySnap();
+$('chk-labels').onchange = (e) =>
+  labelSprites.forEach((s) => (s.visible = e.target.checked));
+$('chk-walls').onchange = (e) => applyRoomTransparency(e.target.checked);
+
+window.addEventListener('keydown', (e) => {
+  if (e.target.tagName === 'INPUT') return;
+  if (e.key === 'g' || e.key === 'm') { mode = 'translate'; applyMode(); }
+  if (e.key === 'r') { mode = 'rotate'; applyMode(); }
+  if (e.key === 'c') { $('btn-camera').click(); }
+  if (e.key === 'd') { $('btn-measure').click(); }
+  if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) deleteSelectedObject();
+});
+
+// ── Delete object ─────────────────────────────────────────────────────────────
+async function deleteSelectedObject() {
+  const id = selectedId;
+  if (!id) return;
+  const obj = byId.get(id);
+  if (!confirm(`Delete "${obj.label}" from the scene? This cannot be undone.`)) return;
+
+  try {
+    const r = await fetch(`/api/scenes/${sceneName}/objects/${id}`, { method: 'DELETE' });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      toast(`Delete failed — ${err.error || r.status}`);
+      return;
+    }
+  } catch (err) {
+    toast('Delete failed — is app.py server running?');
+    return;
+  }
+
+  select(null);
+  const group = objectGroups.get(id);
+  if (group) {
+    scene.remove(group);
+    group.traverse((n) => {
+      if (n.isMesh) { n.geometry?.dispose(); n.material?.dispose(); }
+    });
+  }
+  objectGroups.delete(id);
+  hoverBoxes.delete(id);
+  meshContainers.delete(id);
+  byId.delete(id);
+  sceneData.objects = sceneData.objects.filter((o) => o.id !== id);
+  $('row-' + id)?.remove();
+  toast('Object deleted ✓');
+}
+$('btn-delete-obj').onclick = deleteSelectedObject;
+
+// ── Regenerate with TRELLIS.2 ─────────────────────────────────────────────────
+$('btn-regen').onclick = async () => {
+  const id = selectedId;
+  if (!id) return;
+  const obj = byId.get(id);
+  const btn = $('btn-regen');
+  const prev = btn.textContent;
+  btn.disabled = true; btn.textContent = 'Generating…';
+  toast('Regenerating with TRELLIS.2 — this can take up to a minute…', 90000);
+  try {
+    const r = await fetch(`/api/scenes/${sceneName}/objects/${id}/regenerate`, { method: 'POST' });
+    if (!r.ok) {
+      const err = await r.json().catch(() => ({}));
+      toast(`Regenerate failed — ${err.error || r.status}`);
+      return;
+    }
+  } catch (err) {
+    toast('Regenerate failed — is the server running?');
+    return;
+  } finally {
+    btn.disabled = false; btn.textContent = prev;
+  }
+  // The new mesh is built at the object's metric size, bottom-centred, so drop
+  // any fit transform and reload it in place.
+  obj.model_scale = [1, 1, 1];
+  obj.model_offset = [0, 0, 0];
+  obj.source = 'trellis';
+  loadObjectMesh(obj, objectGroups.get(id));
+  if (selectedId === id) refreshInspector();
+  toast('Regenerated with TRELLIS.2 ✓');
+};
+
+// ── Replace model ─────────────────────────────────────────────────────────────
+$('btn-replace-model').onclick = () => $('file-model-upload').click();
+
+$('file-model-upload').onchange = (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';  // allow re-selecting the same file next time
+  if (!file || !selectedId) return;
+  const id = selectedId;
+  const obj = byId.get(id);
+
+  file.arrayBuffer().then((buf) => {
+    loader.parse(buf, '', async (g) => {
+      const box = new THREE.Box3().setFromObject(g.scene);
+      const size = box.getSize(new THREE.Vector3());
+      const center = box.getCenter(new THREE.Vector3());
+      if (size.x < 1e-6 || size.y < 1e-6 || size.z < 1e-6) {
+        toast('Upload failed — model has no visible geometry.');
+        return;
+      }
+
+      // Fit: non-uniform per-axis scale to the detected size, plus an offset
+      // that re-centres the upload's own (arbitrary) origin to bottom-centre —
+      // the convention every other object glb in this scene already uses.
+      const scale = [obj.size[0] / size.x, obj.size[1] / size.y, obj.size[2] / size.z];
+      const offset = [-center.x, -box.min.y, -center.z];
+
+      const form = new FormData();
+      form.append('file', file);
+      form.append('scale', JSON.stringify(scale));
+      form.append('offset', JSON.stringify(offset));
+      try {
+        const r = await fetch(`/api/scenes/${sceneName}/objects/${id}/model`, {
+          method: 'POST', body: form,
+        });
+        if (!r.ok) {
+          const err = await r.json().catch(() => ({}));
+          toast(`Upload failed — ${err.error || r.status}`);
+          return;
+        }
+      } catch (err) {
+        toast('Upload failed — is app.py server running?');
+        return;
+      }
+
+      obj.model_scale = scale;
+      obj.model_offset = offset;
+      obj.source = 'custom-upload';
+      loadObjectMesh(obj, objectGroups.get(id));
+      if (selectedId === id) refreshInspector();
+      toast('Model replaced ✓');
+    }, () => toast('Could not read that file — is it a valid .glb?'));
+  });
+};
+
+// ── Save ──────────────────────────────────────────────────────────────────────
+$('btn-save').onclick = async () => {
+  const activeLabelInput = $('obj-label-input');
+  if (activeLabelInput) activeLabelInput.blur();
+  const objects = sceneData.objects.map((obj) => {
+    const g = objectGroups.get(obj.id);
+    return {
+      id: obj.id,
+      label: obj.label.trim(),
+      position: g ? [g.position.x, g.position.y, g.position.z] : obj.position,
+      yaw: g ? -g.rotation.y : obj.yaw,
+    };
+  });
+  if (objects.some((obj) => !obj.label)) {
+    toast('Label cannot be empty.');
+    return;
+  }
+  try {
+    const r = await fetch(`/api/scenes/${sceneName}/layout`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ objects }),
+    });
+    toast(r.ok ? 'Layout saved back to disk ✓' : `Save failed (${r.status})`);
+  } catch (err) {
+    toast('Save failed — is app.py server running?');
+  }
+};
+
+// ── Render loop ───────────────────────────────────────────────────────────────
+renderer.setAnimationLoop(() => {
+  activeOrbit.update();
+  renderer.render(scene, activeCamera);
+});
+</script>
+</body>
+</html>
