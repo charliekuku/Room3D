@@ -8,12 +8,6 @@ One-time setup:
        modal volume put room3d-checkpoints checkpoints/vggt_omega_1b_512.pt vggt_omega_1b_512.pt
   3. Secret for the Gemini auto-label button (or remove GEMINI_SECRET below):
        modal secret create gemini GEMINI_API_KEY=xxx
-  4. TRELLIS.2 requires Meta's gated DINOv3 encoder. Request/accept access at
-       https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
-     using the account that owns your read token, then create the Modal secret:
-       modal secret create huggingface HF_TOKEN=hf_xxx
-     Room3D supplies SAM alpha masks and disables TRELLIS.2's otherwise eager
-     local RMBG-2.0 loader, so briaai/RMBG-2.0 access is not required.
 
 GDINO + SAM weights are ungated and download automatically on the first run
 (get_model / the detection path fetch them into the hf-cache Volume).
@@ -53,10 +47,6 @@ VOLUMES = {
 
 # gemini: only needed for the auto-label button in the UI.
 GEMINI_SECRET = [modal.Secret.from_name("gemini", required_keys=["GEMINI_API_KEY"])]
-# TRELLIS.2 loads Meta's gated DINOv3 image encoder at runtime. The token's
-# Hugging Face account must first be granted access to
-# facebook/dinov3-vitl16-pretrain-lvd1689m.
-HF_SECRET = [modal.Secret.from_name("huggingface", required_keys=["HF_TOKEN"])]
 
 # Mirrors setup.sh: clone VGGT-Omega, install its requirements + ours.
 image = (
@@ -178,23 +168,9 @@ trellis_image = (
     # here is a no-op skip; the remaining extensions now find `wheel`.
     .run_commands(
         f"cd {TRELLIS_ROOT} && bash setup.sh --basic --flash-attn --nvdiffrast "
-        f"--nvdiffrec --cumesh --o-voxel --flexgemm",
-        gpu="L4",
-    )
-    # setup.sh installs an unconstrained `transformers`, which now resolves to
-    # 5.x. TRELLIS.2's DINOv3FeatureExtractor accesses the 4.57 model layout
-    # (`DINOv3ViTModel.layer`); 5.x removed that attribute and fails only when
-    # the first object is generated. Match Microsoft's working Space exactly.
-    # This image is isolated from Room3D's reconstruction image, which keeps
-    # transformers 5.13 for Grounding DINO + SAM2.
-    .pip_install("transformers==4.57.3")
-    .run_commands(
+        f"--nvdiffrec --cumesh --o-voxel --flexgemm && "
         f"PYTHONPATH={TRELLIS_ROOT} python -c \"from trellis2.pipelines import "
-        f"Trellis2ImageTo3DPipeline; import transformers; "
-        f"assert transformers.__version__ == '4.57.3'; "
-        f"print('TRELLIS.2 pipeline import OK, transformers', transformers.__version__)\"",
-        # Importing FlexGEMM initializes Triton's active CUDA driver, so even
-        # this no-inference validation must run on a GPU builder.
+        f"Trellis2ImageTo3DPipeline; print('TRELLIS.2 pipeline import OK')\"",
         gpu="L4",
     )
     .add_local_dir("src", remote_path=f"{APP_ROOT}/src")
@@ -205,7 +181,6 @@ trellis_image = (
     image=trellis_image,
     gpu="L4",  # 24 GB — the whole card to itself. Bump to "L40S" if you see OOM/latency.
     volumes={HF_CACHE: trellis_hf_vol, f"{APP_ROOT}/scenes": scenes_vol},
-    secrets=HF_SECRET,
     timeout=1800,
     scaledown_window=120,
     max_containers=1,  # keep the ~10-12 GB 4B weights warm across a scene's objects
@@ -236,9 +211,7 @@ def generate_object_glb(crop_rgb) -> bytes | None:
     # scheduling"). Watch logs for CPU OOM and raise this back up if hit.
     memory=16384,
     volumes=VOLUMES,
-    # Grounding DINO downloads from Hugging Face in this worker. Supplying the
-    # token avoids unauthenticated Hub requests and their lower rate limits.
-    secrets=GEMINI_SECRET + HF_SECRET,
+    secrets=GEMINI_SECRET,
     timeout=3600,
     scaledown_window=120,  # idle seconds before scale-to-zero stops billing
     # No @modal.concurrent here on purpose: this function does the actual

@@ -30,6 +30,7 @@ os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 # Disable MPS memory high-watermark abort.
 os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
 import json
+import math
 import shutil
 import tempfile
 import traceback
@@ -65,6 +66,10 @@ from vggt_omega.utils.load_fn import load_and_preprocess_images
 from vggt_omega.utils.pose_enc import encoding_to_camera
 from visual_util import predictions_to_glb
 from src.detection.dedup import suppress_overlapping_boxes
+from src.detection.label_taxonomy import (
+    CANONICAL_MAJOR_LABELS,
+    normalize_major_suggestions,
+)
 from src.reconstruction.tsdf_fusion import predictions_to_mesh_glb, predictions_to_mesh_poisson
 
 
@@ -297,6 +302,27 @@ _gdino_processor = None
 
 DEFAULT_DETECT_PROMPT = "chair . table . backpack . water bottle . laptop . whiteboard . television . remote control ."
 
+_PLANAR_DETECTION_TERMS = (
+    "television", "tv", "monitor", "screen", "mirror", "window", "glass door",
+)
+
+
+def _is_planar_detection_category(label: str) -> bool:
+    value = str(label).lower().strip()
+    return any(term == value or term in value for term in _PLANAR_DETECTION_TERMS)
+
+
+def _enhance_dark_planar_image(image: PILImage.Image) -> PILImage.Image:
+    """Lift dark reflective displays for a detection-only second pass."""
+    rgb = np.asarray(image.convert("RGB"), np.uint8)
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    l_chan, a_chan, b_chan = cv2.split(lab)
+    l_chan = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8)).apply(l_chan)
+    enhanced = cv2.cvtColor(cv2.merge([l_chan, a_chan, b_chan]), cv2.COLOR_LAB2RGB)
+    # Gamma < 1 brightens shadows while retaining the CLAHE-recovered bezel.
+    lut = np.clip((np.arange(256) / 255.0) ** 0.62 * 255.0, 0, 255).astype(np.uint8)
+    return PILImage.fromarray(cv2.LUT(enhanced, lut))
+
 
 def get_gdino():
     global _gdino_model, _gdino_processor
@@ -386,19 +412,17 @@ def detect_objects_2d(
 ) -> list[dict]:
     """Run Grounding DINO on each image. Returns one dict per frame."""
     model, processor = get_gdino()
-    formatted = _format_prompt(prompt)
     categories = _prompt_categories(prompt)
+    formatted = _format_prompt(prompt)
+    planar_categories = [cat for cat in categories if _is_planar_detection_category(cat)]
     results = []
     t0 = time.time()
     n = len(image_paths)
 
-    for i, path in enumerate(image_paths):
-        _abort_if_cancelled()
-        if progress_cb is not None and (i % 10 == 0 or i == n - 1):
-            progress_cb(i / max(n, 1), f"Detecting objects: {i}/{n} frames")
-        img = PILImage.open(path).convert("RGB")
+    def infer_image(img: PILImage.Image, text: str, requested: list[str],
+                    threshold: float) -> tuple[np.ndarray, list[str], np.ndarray]:
         W, H = img.size
-        inputs = processor(images=img, text=formatted, return_tensors="pt").to(model.device)
+        inputs = processor(images=img, text=text, return_tensors="pt").to(model.device)
         with torch.no_grad():
             outputs = model(**inputs)
         try:
@@ -409,33 +433,56 @@ def detect_objects_2d(
                 det = processor.post_process_grounded_object_detection(
                     outputs,
                     inputs.input_ids,
-                    box_threshold=box_threshold,
+                    box_threshold=threshold,
                     text_threshold=text_threshold,
                     target_sizes=[(H, W)],
                 )[0]
         except TypeError:
-            # newer transformers removed threshold params — filter manually
             det = processor.post_process_grounded_object_detection(
                 outputs,
                 inputs.input_ids,
                 target_sizes=[(H, W)],
             )[0]
-            mask = det["scores"] > box_threshold
+            score_mask = det["scores"] > threshold
             det = {
-                "boxes":  det["boxes"][mask],
-                "labels": [_text_labels(det)[i] for i, m in enumerate(mask) if m],
-                "scores": det["scores"][mask],
+                "boxes": det["boxes"][score_mask],
+                "labels": [_text_labels(det)[j] for j, keep in enumerate(score_mask) if keep],
+                "scores": det["scores"][score_mask],
             }
-        # Snap every Grounding DINO span to one of the requested categories and
-        # drop anything that matches none, so the scene only ever contains the
-        # labels you asked for.
         boxes = det["boxes"].cpu().numpy()
         scores = det["scores"].cpu().numpy()
-        snapped = [_snap_label(lbl, categories) for lbl in _text_labels(det)]
-        keep = [k for k, s in enumerate(snapped) if s is not None]
-        boxes = boxes[keep]
-        scores = scores[keep]
-        labels = [snapped[k] for k in keep]
+        snapped = [_snap_label(label, requested) for label in _text_labels(det)]
+        keep = [j for j, label in enumerate(snapped) if label is not None]
+        return boxes[keep], [snapped[j] for j in keep], scores[keep]
+
+    # At most ~12 extra GDINO calls per reconstruction. This gives uniform
+    # coverage without doubling detection time on every sampled video frame.
+    enhanced_stride = max(1, int(np.ceil(n / 12)))
+    for i, path in enumerate(image_paths):
+        _abort_if_cancelled()
+        if progress_cb is not None and (i % 10 == 0 or i == n - 1):
+            progress_cb(i / max(n, 1), f"Detecting objects: {i}/{n} frames")
+        img = PILImage.open(path).convert("RGB")
+        W, H = img.size
+        boxes, labels, scores = infer_image(img, formatted, categories, box_threshold)
+
+        # A black TV/mirror can be invisible to the ordinary pass while its
+        # reflected contents remain easy to ground. Uniformly sample a second,
+        # shadow-lifted pass for any requested planar labels still missing.
+        if planar_categories and (i % enhanced_stride == 0 or i == n - 1):
+            found = {label for label in labels if _is_planar_detection_category(label)}
+            missing = [label for label in planar_categories if label not in found]
+            if missing:
+                enhanced = _enhance_dark_planar_image(img)
+                e_boxes, e_labels, e_scores = infer_image(
+                    enhanced, _format_prompt(" . ".join(missing)), missing,
+                    max(0.18, box_threshold - 0.08),
+                )
+                if len(e_boxes):
+                    boxes = np.concatenate([boxes, e_boxes], axis=0)
+                    scores = np.concatenate([scores, e_scores], axis=0)
+                    labels.extend(e_labels)
+
         keep = suppress_overlapping_boxes(boxes, labels, scores)
         results.append({
             "boxes":      boxes[keep],
@@ -702,18 +749,47 @@ def run_vggt_omega(image_paths: list[str]) -> dict:
 
 # ── Gemini Vision label suggestion ───────────────────────────────────────────
 
-_VISION_LABEL_PROMPT = (
-    "You are analysing a photo of a room (office or data center). "
-    "List every distinct object category you can see that would be useful for 3D space "
-    "mapping and inventory. Be specific: use 'server rack' not 'equipment', "
-    "'network switch' not 'device'. "
-    "Return ONLY a comma-separated list, nothing else. "
-    "Example: server rack, monitor, desk, chair, patch panel, cable tray"
-)
+_VISION_LABEL_PROMPT = f"""Identify only major persistent physical object
+categories useful for reconstructing this office or data-center room.
+
+Include furniture, large freestanding equipment, doors and windows, plus
+installed data-centre inventory such as switches and patch panels. Exclude
+people, reflections, shadows, decorations, small portable clutter, bottles,
+remotes, stationery, cables, and object parts such as chair backs, table legs,
+or monitor stands. Return categories, not instances: six chairs means one
+'chair' category. Never return both synonyms or a vague parent category.
+
+Choose labels only from this canonical vocabulary:
+{', '.join(CANONICAL_MAJOR_LABELS)}
+
+Return at most 10 categories. ``frames_seen`` is the number of supplied frames
+where the category is visible. ``major`` must be false for excluded clutter.
+"""
+
+_VISION_LABEL_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "categories": {
+            "type": "array",
+            "maxItems": 10,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string", "enum": list(CANONICAL_MAJOR_LABELS)},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                    "frames_seen": {"type": "integer", "minimum": 1},
+                    "major": {"type": "boolean"},
+                },
+                "required": ["label", "confidence", "frames_seen", "major"],
+            },
+        }
+    },
+    "required": ["categories"],
+}
 
 
 def auto_detect_labels(image_files, video_file, sample_fps: float):
-    """Send 1-2 frames to Gemini Vision and return suggested detection labels."""
+    """Ask Gemini for a small canonical category set from distributed views."""
     if video_file is not None:
         video_path = video_file if isinstance(video_file, str) else video_file["name"]
         paths = extract_video_frames(video_path, sample_fps)
@@ -725,7 +801,10 @@ def auto_detect_labels(image_files, video_file, sample_fps: float):
     if not paths:
         return gr.update(), "*Upload images or a video first.*"
 
-    indices = sorted({0, len(paths) // 2})
+    indices = sorted({
+        int(round((len(paths) - 1) * fraction))
+        for fraction in (0.0, 0.25, 0.5, 0.75, 1.0)
+    })
     samples = [paths[i] for i in indices if i < len(paths)]
 
     api_key = os.environ.get("GEMINI_API_KEY")
@@ -740,13 +819,26 @@ def auto_detect_labels(image_files, video_file, sample_fps: float):
     try:
         client = genai.Client(api_key=api_key)
         images = [PILImage.open(p).convert("RGB") for p in samples]
+        contents = [_VISION_LABEL_PROMPT]
+        for frame_id, image in enumerate(images):
+            contents.extend([f"Sampled frame {frame_id}", image])
         response = client.models.generate_content(
             model="gemini-2.5-flash",
-            contents=[*images, _VISION_LABEL_PROMPT],
+            contents=contents,
+            config={
+                "response_mime_type": "application/json",
+                "response_schema": _VISION_LABEL_SCHEMA,
+                "temperature": 0.1,
+            },
         )
-        labels = response.text.strip().rstrip(".")
-        n = len([l for l in labels.split(",") if l.strip()])
-        return gr.update(value=labels), f"*Gemini suggested {n} categories from {len(samples)} frame(s).*"
+        payload = json.loads(response.text)
+        labels = normalize_major_suggestions(
+            payload.get("categories", []), sampled_frames=len(samples)
+        )
+        if not labels:
+            return gr.update(), "*Gemini found no sufficiently supported major categories.*"
+        value = ", ".join(labels)
+        return gr.update(value=value), f"*Gemini suggested {len(labels)} major canonical categories from {len(samples)} frame(s).*"
     except Exception as exc:
         return gr.update(), f"*Gemini API error: {exc}*"
 
@@ -873,8 +965,6 @@ def _pipeline(
         status_cb(0.1, f"Running VGGT-Omega on {len(paths)} frames…")
         preds = run_vggt_omega(paths)
         _abort_if_cancelled()
-        elapsed = time.time() - t0
-
         status_cb(0.5, f"Building {output_type.lower()}…")
 
         if output_type == "Mesh (TSDF)":
@@ -975,6 +1065,7 @@ def _pipeline(
         scene.export(glb_out_path)
 
         # ── Status message ──
+        elapsed = time.time() - t0
         src = "frames" if video_path_in is not None else "views"
         det_note = f", {len(dets_3d)} objects detected" if detect_enabled else ""
         msg = f"Done in {elapsed:.1f}s — {len(paths)} {src} @ {IMAGE_RESOLUTION}px on {DEVICE} ({mode}{det_note})."
@@ -1409,6 +1500,7 @@ with gr.Blocks(
 
 def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
                  reload_scenes_fn=None, object_generator_fn=None):
+    import inspect
     from fastapi import FastAPI, Request, UploadFile, File, Form
     from fastapi.responses import JSONResponse
     from fastapi.staticfiles import StaticFiles
@@ -1423,6 +1515,28 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
 
     os.makedirs(SCENES_DIR, exist_ok=True)
     api = FastAPI()
+
+    async def commit_scene_changes():
+        """Make editor mutations durable on Modal's shared scenes Volume."""
+        if COMMIT_SCENES_FN is None:
+            return
+        result = COMMIT_SCENES_FN()
+        if inspect.isawaitable(result):
+            await result
+
+    def write_scene_json(path: str, scene_json: dict):
+        """Atomically replace scene.json so readers never observe a partial file."""
+        scene_dir = os.path.dirname(path)
+        with tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", dir=scene_dir, delete=False,
+        ) as tmp:
+            tmp_path = tmp.name
+            json.dump(scene_json, tmp, indent=2)
+        try:
+            os.replace(tmp_path, path)
+        finally:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
 
     @api.post("/api/scenes/{name}/layout")
     async def save_layout(name: str, request: Request):
@@ -1453,13 +1567,25 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
         for obj in scene_json["objects"]:
             upd = updates.get(obj["id"])
             if upd:
-                obj["position"] = [round(float(v), 4) for v in upd["position"]]
-                obj["yaw"] = round(float(upd["yaw"]), 5)
+                try:
+                    position = [float(v) for v in upd["position"]]
+                    yaw = float(upd["yaw"])
+                    if len(position) != 3 or not all(math.isfinite(v) for v in position):
+                        raise ValueError
+                    if not math.isfinite(yaw):
+                        raise ValueError
+                except (KeyError, OverflowError, TypeError, ValueError):
+                    return JSONResponse(
+                        {"error": "position must be three finite numbers and yaw must be finite"},
+                        status_code=400,
+                    )
+                obj["position"] = [round(v, 4) for v in position]
+                obj["yaw"] = round(yaw, 5)
                 if "label" in upd:
                     obj["label"] = upd["label"]
                 n += 1
-        with open(path, "w") as f:
-            json.dump(scene_json, f, indent=2)
+        write_scene_json(path, scene_json)
+        await commit_scene_changes()
         return {"ok": True, "updated": n}
 
     @api.post("/api/scenes/{name}/objects/{obj_id}/model")
@@ -1467,13 +1593,14 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
         name: str, obj_id: str,
         file: UploadFile = File(...), scale: str = Form(...), offset: str = Form("[0,0,0]"),
     ):
-        """Replace a detected object's mesh with an uploaded GLB. `scale` is a
-        JSON [sx, sy, sz] computed client-side to fit the upload's own
-        bounding box to the object's already-detected size, and `offset` is a
-        JSON [ox, oy, oz] re-centring the upload's own (arbitrary) origin to
-        the bottom-centre-at-origin convention every other object glb uses.
-        Both are stored as metadata, not baked into the mesh, so they're
-        applied the same way position/yaw already are, and stay reversible."""
+        """Replace a detected object's mesh with an uploaded GLB.
+
+        `scale` and `offset` are the client's exact-box fallback. When the
+        scene contains retained per-object scan points, the server instead
+        chooses constrained scale/yaw/translation metadata that maximizes
+        point agreement without freely distorting the asset. Transforms remain
+        metadata rather than being baked into the GLB, so they are reversible.
+        """
         if "/" in name or "\\" in name or ".." in name:
             return JSONResponse({"error": "bad scene name"}, status_code=400)
         if "/" in obj_id or "\\" in obj_id or ".." in obj_id:
@@ -1491,32 +1618,85 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
 
         try:
             model_scale = [float(v) for v in json.loads(scale)]
-            if len(model_scale) != 3 or any(v <= 0 for v in model_scale):
+            if (len(model_scale) != 3
+                    or any(v <= 0 or not math.isfinite(v) for v in model_scale)):
                 raise ValueError
-        except (ValueError, TypeError):
+        except (OverflowError, ValueError, TypeError):
             return JSONResponse({"error": "scale must be [sx, sy, sz], all > 0"}, status_code=400)
 
         try:
             model_offset = [float(v) for v in json.loads(offset)]
-            if len(model_offset) != 3:
+            if len(model_offset) != 3 or any(not math.isfinite(v) for v in model_offset):
                 raise ValueError
-        except (ValueError, TypeError):
+        except (OverflowError, ValueError, TypeError):
             return JSONResponse({"error": "offset must be [ox, oy, oz]"}, status_code=400)
 
         content = await file.read()
         if content[:4] != b"glTF":
             return JSONResponse({"error": "file must be a binary .glb"}, status_code=400)
 
-        glb_path = os.path.join(scene_dir, "objects", f"{obj_id}.glb")
-        with open(glb_path, "wb") as f:
-            f.write(content)
+        # New scenes retain a compact sample of the original scan for each
+        # object. Use it to choose a proportion-preserving scale, asset-local
+        # yaw and small horizontal correction. Older scenes (or weak scans)
+        # retain the client-computed exact bounding-box fit as a safe fallback.
+        try:
+            from src.detection.model_fitting import fit_uploaded_glb
+            fitted = fit_uploaded_glb(
+                content,
+                obj.get("size", []),
+                obj.get("fit_points"),
+                model_scale,
+                model_offset,
+            )
+        except Exception as exc:
+            print(f"[Room3D] Point-guided replacement fit failed ({exc}); using box fit.")
+            fitted = {
+                "model_scale": model_scale,
+                "model_offset": model_offset,
+                "model_yaw": 0.0,
+                "model_translation": [0.0, 0.0, 0.0],
+                "fit": {"method": "bounding-box-fallback", "reason": "fit-error"},
+            }
 
-        obj["model_scale"] = [round(v, 5) for v in model_scale]
-        obj["model_offset"] = [round(v, 5) for v in model_offset]
+        # Detach this object from any deduplicated/shared asset. Otherwise an
+        # upload for a reused object is written but the editor keeps loading the
+        # representative object's GLB from obj["glb"].
+        glb_rel = f"objects/{obj_id}_custom.glb"
+        glb_path = os.path.join(scene_dir, glb_rel)
+        os.makedirs(os.path.dirname(glb_path), exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            suffix=".glb", dir=os.path.dirname(glb_path), delete=False,
+        ) as tmp:
+            tmp_glb_path = tmp.name
+            tmp.write(content)
+        try:
+            os.replace(tmp_glb_path, glb_path)
+        finally:
+            if os.path.exists(tmp_glb_path):
+                os.remove(tmp_glb_path)
+
+        obj["glb"] = glb_rel
+        obj["model_scale"] = [round(float(v), 5) for v in fitted["model_scale"]]
+        obj["model_offset"] = [round(float(v), 5) for v in fitted["model_offset"]]
+        obj["model_yaw"] = round(float(fitted.get("model_yaw", 0.0)), 5)
+        obj["model_translation"] = [
+            round(float(v), 5) for v in fitted.get("model_translation", [0, 0, 0])
+        ]
+        obj["model_fit"] = fitted.get("fit", {"method": "bounding-box-fallback"})
         obj["source"] = "custom-upload"
-        with open(path, "w") as f:
-            json.dump(scene_json, f, indent=2)
-        return {"ok": True}
+        obj.pop("reuse_of", None)
+        write_scene_json(path, scene_json)
+        await commit_scene_changes()
+        return {
+            "ok": True,
+            "source": "custom-upload",
+            "glb": glb_rel,
+            "model_scale": obj["model_scale"],
+            "model_offset": obj["model_offset"],
+            "model_yaw": obj["model_yaw"],
+            "model_translation": obj["model_translation"],
+            "model_fit": obj["model_fit"],
+        }
 
     @api.delete("/api/scenes/{name}/objects/{obj_id}")
     async def delete_object(name: str, obj_id: str):
@@ -1531,16 +1711,35 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
 
         with open(path) as f:
             scene_json = json.load(f)
+        removed = next((o for o in scene_json["objects"] if o["id"] == obj_id), None)
         before = len(scene_json["objects"])
         scene_json["objects"] = [o for o in scene_json["objects"] if o["id"] != obj_id]
         if len(scene_json["objects"]) == before:
             return JSONResponse({"error": "object not found"}, status_code=404)
-        with open(path, "w") as f:
-            json.dump(scene_json, f, indent=2)
+        write_scene_json(path, scene_json)
 
-        glb_path = os.path.join(scene_dir, "objects", f"{obj_id}.glb")
-        if os.path.exists(glb_path):
-            os.remove(glb_path)
+        # Remove only assets that no remaining object references. This matters
+        # for deduplicated scenes, where several objects can intentionally share
+        # one representative GLB.
+        referenced = {o.get("glb") for o in scene_json["objects"] if o.get("glb")}
+        candidates = {
+            removed.get("glb") if removed else None,
+            f"objects/{obj_id}.glb",
+            f"objects/{obj_id}_custom.glb",
+            f"objects/{obj_id}_trellis.glb",
+        }
+        objects_root = os.path.realpath(os.path.join(scene_dir, "objects"))
+        for rel in candidates - {None}:
+            if rel in referenced:
+                continue
+            candidate = os.path.realpath(os.path.join(scene_dir, rel))
+            try:
+                inside_objects = os.path.commonpath([objects_root, candidate]) == objects_root
+            except ValueError:
+                inside_objects = False
+            if inside_objects and os.path.isfile(candidate):
+                os.remove(candidate)
+        await commit_scene_changes()
         return {"ok": True}
 
     @api.post("/api/scenes/{name}/objects/{obj_id}/regenerate")
@@ -1567,18 +1766,20 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
         if obj is None:
             return JSONResponse({"error": "object not found"}, status_code=404)
 
-        # Input image: the RGBA subject cutout if we saved one, else the photo.
+        # TRELLIS.2 is configured to use Room3D's saved SAM alpha rather than
+        # downloading/running a second background-removal model. A plain JPEG
+        # photo therefore cannot be used as a silent fallback here.
         crop = None
-        for rel in (obj.get("input_crop"), obj.get("photo")):
-            if rel and os.path.exists(os.path.join(scene_dir, rel)):
-                img = cv2.imread(os.path.join(scene_dir, rel), cv2.IMREAD_UNCHANGED)
-                if img is None:
-                    continue
-                crop = (cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA) if img.ndim == 3 and img.shape[2] == 4
-                        else cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
-                break
+        rel = obj.get("input_crop")
+        if rel and os.path.exists(os.path.join(scene_dir, rel)):
+            img = cv2.imread(os.path.join(scene_dir, rel), cv2.IMREAD_UNCHANGED)
+            if img is not None and img.ndim == 3 and img.shape[2] == 4:
+                crop = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
         if crop is None:
-            return JSONResponse({"error": "no source image saved for this object"}, status_code=400)
+            return JSONResponse(
+                {"error": "no RGBA SAM input crop saved for this object; reconstruct the scene first"},
+                status_code=400,
+            )
 
         try:
             glb_bytes = await OBJECT_GENERATOR_AIO(crop)
@@ -1593,18 +1794,39 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
         mesh = _glb_bytes_to_local_mesh(glb_bytes, obj["size"])
         if mesh is None:
             return JSONResponse({"error": "generated mesh could not be processed"}, status_code=502)
-        glb_path = os.path.join(scene_dir, "objects", f"{obj_id}.glb")
-        trimesh.Scene([_ensure_material(mesh)]).export(glb_path)
+        # Always detach the selected object from its current asset. In scenes
+        # built with duplicate asset reuse, obj.glb may point at another
+        # object's file; overwriting obj_id.glb without changing this field made
+        # regeneration appear to succeed while the editor reloaded the old GLB.
+        # A distinct suffix also prevents regenerating a representative from
+        # silently changing every other object that shares its original asset.
+        glb_rel = f"objects/{obj_id}_trellis.glb"
+        glb_path = os.path.join(scene_dir, glb_rel)
+        os.makedirs(os.path.dirname(glb_path), exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            suffix=".glb", dir=os.path.dirname(glb_path), delete=False,
+        ) as tmp:
+            tmp_glb_path = tmp.name
+        try:
+            trimesh.Scene([_ensure_material(mesh)]).export(tmp_glb_path)
+            os.replace(tmp_glb_path, glb_path)
+        finally:
+            if os.path.exists(tmp_glb_path):
+                os.remove(tmp_glb_path)
 
         # The mesh is now built at the object's metric size, bottom-centred, so
         # reset the fit transform and mark the source.
+        obj["glb"] = glb_rel
         obj["model_scale"] = [1, 1, 1]
         obj["model_offset"] = [0, 0, 0]
+        obj.pop("model_yaw", None)
+        obj.pop("model_translation", None)
+        obj.pop("model_fit", None)
         obj["source"] = "trellis"
         obj.pop("reuse_of", None)
-        with open(path, "w") as f:
-            json.dump(scene_json, f, indent=2)
-        return {"ok": True, "source": "trellis"}
+        write_scene_json(path, scene_json)
+        await commit_scene_changes()
+        return {"ok": True, "source": "trellis", "glb": glb_rel}
 
     api.mount("/editor", StaticFiles(directory=EDITOR_DIR, html=True), name="editor")
     api.mount("/scenes", StaticFiles(directory=SCENES_DIR), name="scenes")

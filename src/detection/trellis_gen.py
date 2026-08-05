@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import time
 
 import numpy as np
 
@@ -129,15 +130,19 @@ def generate_glb_from_image(
     from PIL import Image
     import o_voxel
 
+    started = time.perf_counter()
     try:
         arr = np.ascontiguousarray(crop_rgb)
         if not _has_foreground_alpha(arr):
             print("[TRELLIS] No usable SAM alpha mask; keeping fallback mesh.", flush=True)
             return None
         image = Image.fromarray(arr, mode="RGBA")
+        pipeline_started = time.perf_counter()
         pipeline = _get_pipeline()
+        pipeline_ready = time.perf_counter()
         with torch.no_grad():
             mesh = pipeline.run(image)[0]
+        inference_done = time.perf_counter()
 
         # PBR-ready GLB. extension_webp=False → PNG textures: three.js's
         # GLTFLoader (the editor) renders those without the EXT_texture_webp
@@ -162,7 +167,17 @@ def generate_glb_from_image(
             )
             glb.export(tmp_path, extension_webp=False)
             with open(tmp_path, "rb") as f:
-                return f.read()
+                data = f.read()
+            finished = time.perf_counter()
+            print(
+                "[TRELLIS] Completed "
+                f"(pipeline-ready={pipeline_ready - pipeline_started:.1f}s, "
+                f"inference={inference_done - pipeline_ready:.1f}s, "
+                f"postprocess/export={finished - inference_done:.1f}s, "
+                f"total={finished - started:.1f}s).",
+                flush=True,
+            )
+            return data
         finally:
             if os.path.exists(tmp_path):
                 os.remove(tmp_path)

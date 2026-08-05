@@ -6,11 +6,24 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 import sys
 import os
+import cv2
+import numpy as np
+import trimesh
 
 # Add src to python path to import app
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
-from src.app import build_server
+from src.app import build_server, _enhance_dark_planar_image
+from PIL import Image as PILImage
+
+
+def test_dark_planar_detection_enhancement_lifts_shadows():
+    gradient = np.tile(np.arange(10, 70, dtype=np.uint8), (80, 2))
+    rgb = np.repeat(gradient[:, :, None], 3, axis=2)
+    enhanced = np.asarray(_enhance_dark_planar_image(PILImage.fromarray(rgb)))
+
+    assert enhanced.shape == rgb.shape
+    assert enhanced.mean() > rgb.mean() + 10
 
 @pytest.fixture
 def mock_scene_dir():
@@ -55,8 +68,13 @@ def test_viewer_api_save_layout(mock_scene_dir):
     """Phase 3 Gate: Verify the viewer API successfully saves 3D object layout changes to disk."""
     scene_name, scene_path = mock_scene_dir
     
+    calls = {"commit": 0}
+
+    async def commit():
+        calls["commit"] += 1
+
     # Initialize TestClient
-    app = build_server()
+    app = build_server(commit_scenes_fn=commit)
     client = TestClient(app)
     
     # Simulate a drag-and-drop event from the Three.js viewer
@@ -76,6 +94,7 @@ def test_viewer_api_save_layout(mock_scene_dir):
     assert response.status_code == 200
     assert response.json()["updated"] == 1
     assert response.json()["ok"] is True
+    assert calls["commit"] == 1
     
     # Verify the file was actually written to disk correctly
     with open(scene_path / "scene.json", "r") as f:
@@ -85,6 +104,75 @@ def test_viewer_api_save_layout(mock_scene_dir):
     assert updated_obj["position"] == [1.5, 0.0, -2.5], "Position was not updated on disk"
     assert updated_obj["yaw"] == 1.5708, "Yaw was not updated on disk"
     assert updated_obj["label"] == "network cabinet", "Label was not updated on disk"
+
+
+def test_viewer_mutations_commit_and_uploaded_model_detaches_shared_asset(mock_scene_dir):
+    scene_name, scene_path = mock_scene_dir
+    objects_dir = scene_path / "objects"
+    objects_dir.mkdir()
+    shared_rel = "objects/obj_001.glb"
+    (scene_path / shared_rel).write_bytes(trimesh.creation.box().export(file_type="glb"))
+
+    with open(scene_path / "scene.json") as f:
+        scene = json.load(f)
+    scene["objects"] = [
+        {**scene["objects"][0], "glb": shared_rel, "reuse_of": "obj_001"},
+        {**scene["objects"][0], "id": "obj_001", "glb": shared_rel},
+    ]
+    with open(scene_path / "scene.json", "w") as f:
+        json.dump(scene, f)
+
+    calls = {"commit": 0}
+
+    async def commit():
+        calls["commit"] += 1
+
+    client = TestClient(build_server(commit_scenes_fn=commit))
+    replacement = trimesh.creation.icosphere(subdivisions=1).export(file_type="glb")
+    response = client.post(
+        f"/api/scenes/{scene_name}/objects/obj_000/model",
+        files={"file": ("replacement.glb", replacement, "model/gltf-binary")},
+        data={"scale": "[1, 2, 3]", "offset": "[0, 0.5, 0]"},
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["glb"] == "objects/obj_000_custom.glb"
+    assert calls["commit"] == 1
+    assert (objects_dir / "obj_000_custom.glb").exists()
+    with open(scene_path / "scene.json") as f:
+        updated = json.load(f)
+    selected, shared = updated["objects"]
+    assert selected["glb"] == "objects/obj_000_custom.glb"
+    assert selected["source"] == "custom-upload"
+    assert "reuse_of" not in selected
+    assert shared["glb"] == shared_rel
+
+    response = client.delete(f"/api/scenes/{scene_name}/objects/obj_001")
+    assert response.status_code == 200
+    assert calls["commit"] == 2
+    assert not (scene_path / shared_rel).exists()
+
+
+def test_deleting_reused_object_preserves_shared_asset(mock_scene_dir):
+    scene_name, scene_path = mock_scene_dir
+    objects_dir = scene_path / "objects"
+    objects_dir.mkdir()
+    shared_rel = "objects/obj_001.glb"
+    (scene_path / shared_rel).write_bytes(trimesh.creation.box().export(file_type="glb"))
+    with open(scene_path / "scene.json") as f:
+        scene = json.load(f)
+    scene["objects"] = [
+        {**scene["objects"][0], "glb": shared_rel, "reuse_of": "obj_001"},
+        {**scene["objects"][0], "id": "obj_001", "glb": shared_rel},
+    ]
+    with open(scene_path / "scene.json", "w") as f:
+        json.dump(scene, f)
+
+    client = TestClient(build_server())
+    response = client.delete(f"/api/scenes/{scene_name}/objects/obj_000")
+
+    assert response.status_code == 200
+    assert (scene_path / shared_rel).exists()
 
 
 def test_viewer_api_rejects_empty_label(mock_scene_dir):
@@ -114,3 +202,66 @@ def test_viewer_api_invalid_scene():
     # Try non-existent scene
     response = client.post("/api/scenes/ghost_scene_999/layout", json={"objects": []})
     assert response.status_code == 404
+
+
+def test_regenerate_detaches_reused_asset_and_commits(mock_scene_dir):
+    scene_name, scene_path = mock_scene_dir
+    objects_dir = scene_path / "objects"
+    objects_dir.mkdir()
+    shared_rel = "objects/obj_001.glb"
+    (scene_path / shared_rel).write_bytes(
+        trimesh.creation.box().export(file_type="glb")
+    )
+
+    rgba = np.zeros((32, 32, 4), np.uint8)
+    rgba[6:26, 6:26, :3] = 160
+    rgba[6:26, 6:26, 3] = 255
+    assert cv2.imwrite(str(objects_dir / "obj_000_input.png"),
+                       cv2.cvtColor(rgba, cv2.COLOR_RGBA2BGRA))
+
+    with open(scene_path / "scene.json") as f:
+        scene = json.load(f)
+    scene["objects"] = [
+        {
+            **scene["objects"][0],
+            "glb": shared_rel,
+            "reuse_of": "obj_001",
+            "input_crop": "objects/obj_000_input.png",
+        },
+        {
+            **scene["objects"][0],
+            "id": "obj_001",
+            "glb": shared_rel,
+        },
+    ]
+    with open(scene_path / "scene.json", "w") as f:
+        json.dump(scene, f)
+
+    calls = {"generate": 0, "commit": 0}
+
+    async def generate(_crop):
+        calls["generate"] += 1
+        return trimesh.creation.icosphere(subdivisions=1).export(file_type="glb")
+
+    async def commit():
+        calls["commit"] += 1
+
+    client = TestClient(build_server(
+        object_generator_fn=generate,
+        commit_scenes_fn=commit,
+    ))
+    response = client.post(
+        f"/api/scenes/{scene_name}/objects/obj_000/regenerate"
+    )
+
+    assert response.status_code == 200, response.text
+    assert response.json()["glb"] == "objects/obj_000_trellis.glb"
+    assert calls == {"generate": 1, "commit": 1}
+    assert (objects_dir / "obj_000_trellis.glb").exists()
+    with open(scene_path / "scene.json") as f:
+        updated = json.load(f)
+    selected, shared = updated["objects"]
+    assert selected["glb"] == "objects/obj_000_trellis.glb"
+    assert selected["source"] == "trellis"
+    assert "reuse_of" not in selected
+    assert shared["glb"] == shared_rel

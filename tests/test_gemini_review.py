@@ -20,9 +20,9 @@ def test_review_relabels_and_propagates_to_frame_detection():
         "id": 0, "action": "relabel", "label": "Office Chair",
         "confidence": 0.92, "reason": "Visible wheeled office chair",
     }])
-    assert kept[0]["label"] == "office chair"
+    assert kept[0]["label"] == "chair"
     assert kept[0]["original_label"] == "seat"
-    assert dets[0]["labels"][0] == "office chair"
+    assert dets[0]["labels"][0] == "chair"
     assert summary["relabeled"] == 1
 
 

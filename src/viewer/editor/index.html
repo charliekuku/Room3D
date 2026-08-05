@@ -233,6 +233,25 @@ function refreshInspector() {
     ? `<br/>Gemini relabeled “${escapeHtml(o.original_label)}”` +
       (o.label_review ? ` · ${(o.label_review.confidence * 100).toFixed(0)}% confidence` : '')
     : '';
+  const reuseLine = o.reuse_of
+    ? `<br/>model shared from ${escapeHtml(o.reuse_of)}` +
+      (Number.isFinite(o.asset_reuse_similarity)
+        ? ` · ${(o.asset_reuse_similarity * 100).toFixed(0)}% appearance match`
+        : '')
+    : '';
+  const verification = o.geometry_verification;
+  const verificationLine = verification
+    ? `<br/>geometry ${escapeHtml(verification.status)}` +
+      ` · support ${(verification.geometry_score * 100).toFixed(0)}%` +
+      (verification.reflection_score > 0
+        ? ` · reflection risk ${(verification.reflection_score * 100).toFixed(0)}%`
+        : '')
+    : '';
+  const modelFitLine = o.model_fit?.method === 'hybrid-point-cloud-v1'
+    ? `<br/>replacement fit ${(o.model_fit.point_agreement * 100).toFixed(0)}% point agreement` +
+      ` · asset yaw ${o.model_fit.yaw_degrees.toFixed(0)}°` +
+      ` · stretch ${o.model_fit.axis_stretch_ratio.toFixed(2)}×`
+    : (o.model_fit ? '<br/>replacement uses bounding-box fallback' : '');
 
   el.innerHTML =
     `<input id="obj-label-input" value="${escapeHtml(o.label)}" maxlength="100" ` +
@@ -244,7 +263,7 @@ function refreshInspector() {
     `pos (${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}) ${unit[units]} · ` +
     `yaw ${(yaw * 180 / Math.PI).toFixed(0)}°<br/>` +
     `detected ${(o.score * 100).toFixed(0)}% · seen in ${o.frames_seen} frame(s)` +
-    qualityLine + reviewLine;
+    qualityLine + reviewLine + reuseLine + verificationLine + modelFitLine;
 
   const labelInput = $('obj-label-input');
   labelInput.addEventListener('input', () => {
@@ -551,6 +570,8 @@ const meshContainers = new Map();
 function loadObjectMesh(obj, group) {
   const s = obj.model_scale || [1, 1, 1];
   const o = obj.model_offset || [0, 0, 0];
+  const t = obj.model_translation || [0, 0, 0];
+  const modelYaw = obj.model_yaw || 0;
   loader.load(base + obj.glb + '?t=' + Date.now(), (g) => {  // cache-bust: same URL can change after a replace
     const old = meshContainers.get(obj.id);
     if (old) {
@@ -561,6 +582,8 @@ function loadObjectMesh(obj, group) {
     }
     g.scene.position.set(o[0], o[1], o[2]);
     const container = new THREE.Group();
+    container.position.set(t[0], t[1], t[2]);
+    container.rotation.y = modelYaw;
     container.scale.set(s[0], s[1], s[2]);
     container.add(g.scene);
     group.add(container);
@@ -1007,6 +1030,7 @@ $('btn-regen').onclick = async () => {
   const prev = btn.textContent;
   btn.disabled = true; btn.textContent = 'Generating…';
   toast('Regenerating with TRELLIS.2 — this can take up to a minute…', 90000);
+  let result;
   try {
     const r = await fetch(`/api/scenes/${sceneName}/objects/${id}/regenerate`, { method: 'POST' });
     if (!r.ok) {
@@ -1014,6 +1038,7 @@ $('btn-regen').onclick = async () => {
       toast(`Regenerate failed — ${err.error || r.status}`);
       return;
     }
+    result = await r.json();
   } catch (err) {
     toast('Regenerate failed — is the server running?');
     return;
@@ -1024,7 +1049,12 @@ $('btn-regen').onclick = async () => {
   // any fit transform and reload it in place.
   obj.model_scale = [1, 1, 1];
   obj.model_offset = [0, 0, 0];
+  delete obj.model_yaw;
+  delete obj.model_translation;
+  delete obj.model_fit;
   obj.source = 'trellis';
+  if (result?.glb) obj.glb = result.glb;
+  delete obj.reuse_of;
   loadObjectMesh(obj, objectGroups.get(id));
   if (selectedId === id) refreshInspector();
   toast('Regenerated with TRELLIS.2 ✓');
@@ -1060,26 +1090,33 @@ $('file-model-upload').onchange = (e) => {
       form.append('file', file);
       form.append('scale', JSON.stringify(scale));
       form.append('offset', JSON.stringify(offset));
+      let result;
       try {
         const r = await fetch(`/api/scenes/${sceneName}/objects/${id}/model`, {
           method: 'POST', body: form,
         });
+        result = await r.json().catch(() => ({}));
         if (!r.ok) {
-          const err = await r.json().catch(() => ({}));
-          toast(`Upload failed — ${err.error || r.status}`);
+          toast(`Upload failed — ${result.error || r.status}`);
           return;
         }
+        if (result.glb) obj.glb = result.glb;
       } catch (err) {
         toast('Upload failed — is app.py server running?');
         return;
       }
 
-      obj.model_scale = scale;
-      obj.model_offset = offset;
+      obj.model_scale = result.model_scale || scale;
+      obj.model_offset = result.model_offset || offset;
+      obj.model_yaw = result.model_yaw || 0;
+      obj.model_translation = result.model_translation || [0, 0, 0];
+      obj.model_fit = result.model_fit || { method: 'bounding-box-fallback' };
       obj.source = 'custom-upload';
+      delete obj.reuse_of;
       loadObjectMesh(obj, objectGroups.get(id));
       if (selectedId === id) refreshInspector();
-      toast('Model replaced ✓');
+      const pointFit = obj.model_fit.method === 'hybrid-point-cloud-v1';
+      toast(pointFit ? 'Model replaced and fitted to scan ✓' : 'Model replaced with bounding-box fit ✓');
     }, () => toast('Could not read that file — is it a valid .glb?'));
   });
 };

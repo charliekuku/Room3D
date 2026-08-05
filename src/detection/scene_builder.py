@@ -36,7 +36,7 @@ import numpy as np
 import trimesh
 
 from src.detection.dedup import box_iou
-from src.detection.photo_projection import apply_photo_texture, recolor_best_view
+from src.detection.photo_projection import apply_photo_texture, project_to_frame, recolor_best_view
 
 # 42U server rack — the metric anchor for data-center scenes
 RACK_HEIGHT_M = 2.0
@@ -333,7 +333,9 @@ def _snap_yaw(yaw: float, room_yaw: float, tol_deg: float = 15.0) -> float:
 def _make_observation(label: str, score: float, frame: int,
                       pts: np.ndarray, cols: np.ndarray,
                       box: np.ndarray | None = None,
-                      det_idx: int | None = None) -> dict:
+                      det_idx: int | None = None,
+                      reflector_inside_ratio: float = 0.0,
+                      reflector_labels: list[str] | None = None) -> dict:
     n_raw = len(pts)          # pre-subsample count ≈ visible mask area
     if len(pts) > _MAX_PTS_PER_OBS:
         sel = np.random.default_rng(0).choice(len(pts), _MAX_PTS_PER_OBS, replace=False)
@@ -344,6 +346,8 @@ def _make_observation(label: str, score: float, frame: int,
         "label": label, "score": score, "frame": frame,
         "pts": pts, "cols": cols, "box": box, "n_raw": n_raw,
         "det_idx": det_idx,
+        "reflector_inside_ratio": float(reflector_inside_ratio),
+        "reflector_labels": list(reflector_labels or []),
         "center": (lo + hi) / 2.0,
         "diag": float(np.linalg.norm(hi - lo)),
     }
@@ -448,9 +452,299 @@ def _instances_have_same_frame_separation(a: dict, b: dict) -> bool:
     for frame in by_frame_a.keys() & by_frame_b.keys():
         for oa in by_frame_a[frame]:
             for ob in by_frame_b[frame]:
-                if not _same_frame_duplicate(oa, ob):
+                # Missing boxes are not positive evidence of two objects. Only
+                # veto a merge when the detector actually drew separate boxes.
+                if _same_frame_distinct(oa, ob):
                     return True
     return False
+
+
+def _point_cloud_overlap_support(
+    a: dict, b: dict, tolerance_ratio: float = 0.075,
+    max_points: int = 1200,
+) -> tuple[float, float]:
+    """Tolerant bidirectional overlap of two instance point clouds.
+
+    Returns ``(containment, mutual)``. Containment is the stronger directional
+    support and catches a partial track contained by a fuller one; mutual is
+    the geometric mean and rejects a tiny nested patch. Distances are scaled by
+    the smaller robust object diagonal, so this works before metric calibration.
+    """
+    pts_a = np.asarray(a.get("pts", []), np.float64)
+    pts_b = np.asarray(b.get("pts", []), np.float64)
+    if pts_a.ndim != 2 or pts_b.ndim != 2 or pts_a.shape[1:] != (3,) or pts_b.shape[1:] != (3,):
+        return 0.0, 0.0
+    pts_a = pts_a[np.isfinite(pts_a).all(axis=1)]
+    pts_b = pts_b[np.isfinite(pts_b).all(axis=1)]
+    if len(pts_a) < 10 or len(pts_b) < 10:
+        return 0.0, 0.0
+    if len(pts_a) > max_points:
+        pts_a = pts_a[np.linspace(0, len(pts_a) - 1, max_points).astype(np.int64)]
+    if len(pts_b) > max_points:
+        pts_b = pts_b[np.linspace(0, len(pts_b) - 1, max_points).astype(np.int64)]
+    lo_a, hi_a = np.percentile(pts_a, [5, 95], axis=0)
+    lo_b, hi_b = np.percentile(pts_b, [5, 95], axis=0)
+    scale = min(float(np.linalg.norm(hi_a - lo_a)),
+                float(np.linalg.norm(hi_b - lo_b)))
+    tolerance = max(tolerance_ratio * scale, 1e-6)
+
+    from scipy.spatial import cKDTree
+    dist_a = cKDTree(pts_b).query(pts_a, k=1, workers=1)[0]
+    dist_b = cKDTree(pts_a).query(pts_b, k=1, workers=1)[0]
+    support_a = float(np.mean(dist_a <= tolerance))
+    support_b = float(np.mean(dist_b <= tolerance))
+    return max(support_a, support_b), float(np.sqrt(support_a * support_b))
+
+
+_REFLECTOR_WORDS = {
+    "television", "tv", "monitor", "screen", "mirror", "window", "glass",
+}
+_PLANAR_PHYSICAL_WORDS = _REFLECTOR_WORDS | {"whiteboard", "door", "panel", "painting"}
+_FLOOR_SUPPORT_WORDS = {
+    "chair", "table", "desk", "cabinet", "rack", "sofa", "couch", "shelf",
+}
+
+
+def _label_has_word(label: str, vocabulary: set[str]) -> bool:
+    value = str(label).lower().strip()
+    tokens = set(value.replace("-", " ").split())
+    return bool(tokens & vocabulary) or value in vocabulary
+
+
+def _is_reflector_label(label: str) -> bool:
+    return _label_has_word(label, _REFLECTOR_WORDS)
+
+
+def _is_planar_physical_label(label: str) -> bool:
+    return _label_has_word(label, _PLANAR_PHYSICAL_WORDS)
+
+
+def _instance_reprojection_agreement(
+    inst: dict, T_total: np.ndarray | None, extrinsic: np.ndarray | None,
+    intrinsic: np.ndarray | None, depth: np.ndarray | None, masks: list | None,
+    max_points: int = 1000,
+) -> float | None:
+    """Cross-project each view's points into the other observed masks."""
+    if any(value is None for value in (T_total, extrinsic, intrinsic, depth, masks)):
+        return None
+    observations = list(inst.get("_observations", []))
+    if len({obs.get("frame") for obs in observations}) < 2:
+        return None
+    inv_total = np.linalg.inv(np.asarray(T_total, float))
+    pair_scores = []
+    for source in observations:
+        source_pts = np.asarray(source.get("pts", []), float)
+        source_pts = source_pts[np.isfinite(source_pts).all(axis=1)] if source_pts.ndim == 2 and source_pts.shape[1:] == (3,) else np.empty((0, 3))
+        if len(source_pts) > max_points:
+            source_pts = source_pts[
+                np.linspace(0, len(source_pts) - 1, max_points).astype(np.int64)
+            ]
+        if len(source_pts) < 10:
+            continue
+        raw_pts = _apply44(inv_total, source_pts)
+        for target in observations:
+            fi, di = target.get("frame"), target.get("det_idx")
+            if fi == source.get("frame") or not isinstance(fi, (int, np.integer)):
+                continue
+            fi = int(fi)
+            if (not isinstance(di, (int, np.integer)) or fi < 0 or
+                    fi >= len(masks) or int(di) < 0 or int(di) >= len(masks[fi])):
+                continue
+            target_mask = masks[fi][int(di)]
+            if target_mask is None:
+                continue
+            d_frame = np.asarray(depth[fi, ..., 0], float)
+            H, W = d_frame.shape
+            target_mask = cv2.resize(
+                target_mask.astype(np.uint8), (W, H), interpolation=cv2.INTER_NEAREST,
+            ).astype(bool)
+            uv, z = project_to_frame(raw_pts, extrinsic[fi], intrinsic[fi])
+            in_bounds = (
+                np.isfinite(uv).all(axis=1) & np.isfinite(z) & (z > 1e-6) &
+                (uv[:, 0] >= 0) & (uv[:, 0] <= W - 1) &
+                (uv[:, 1] >= 0) & (uv[:, 1] <= H - 1)
+            )
+            if in_bounds.sum() < 10:
+                continue
+            ui = np.round(uv[in_bounds, 0]).astype(np.int32)
+            vi = np.round(uv[in_bounds, 1]).astype(np.int32)
+            expected_depth = d_frame[vi, ui]
+            depth_ok = (
+                np.isfinite(expected_depth) & (expected_depth > 1e-6) &
+                (np.abs(z[in_bounds] - expected_depth) <=
+                 0.12 * expected_depth + 0.08)
+            )
+            agreement = target_mask[vi, ui] & depth_ok
+            pair_scores.append(float(np.mean(agreement)))
+    return float(np.median(pair_scores)) if pair_scores else None
+
+
+def _verify_instance_geometry(inst: dict, floor_y: float,
+                              room_height: float, T_total: np.ndarray | None = None,
+                              extrinsic: np.ndarray | None = None,
+                              intrinsic: np.ndarray | None = None,
+                              depth: np.ndarray | None = None,
+                              masks: list | None = None) -> dict:
+    """Conservative multi-view reflection verification for one instance.
+
+    A hard rejection requires repeated containment inside a detected reflector
+    plus geometry that conflicts with the candidate's physical category. Sparse
+    or ambiguous evidence is retained and exposed through the audit fields.
+    """
+    observations = list(inst.get("_observations", []))
+    frames = sorted({int(obs["frame"]) for obs in observations})
+    positive_inside = [
+        float(obs.get("reflector_inside_ratio", 0.0))
+        for obs in observations
+        if float(obs.get("reflector_inside_ratio", 0.0)) >= 0.50
+    ]
+    reflector_hits = len({
+        int(obs["frame"]) for obs in observations
+        if float(obs.get("reflector_inside_ratio", 0.0)) >= 0.70
+    })
+    inside_ratio = float(np.median(positive_inside)) if positive_inside else 0.0
+    reflector_labels = sorted({
+        label for obs in observations for label in obs.get("reflector_labels", [])
+    })
+
+    pair_mutual = []
+    for i in range(len(observations)):
+        for j in range(i + 1, len(observations)):
+            if observations[i]["frame"] == observations[j]["frame"]:
+                continue
+            pair_mutual.append(_point_cloud_overlap_support(
+                observations[i], observations[j]
+            )[1])
+    point_overlap = float(np.median(pair_mutual)) if pair_mutual else 0.0
+    reprojection = _instance_reprojection_agreement(
+        inst, T_total, extrinsic, intrinsic, depth, masks,
+    )
+
+    centers, extents = [], []
+    for obs in observations:
+        pts = np.asarray(obs.get("pts", []), float)
+        pts = pts[np.isfinite(pts).all(axis=1)] if pts.ndim == 2 and pts.shape[1:] == (3,) else np.empty((0, 3))
+        if len(pts) < 10:
+            continue
+        lo, hi = np.percentile(pts, [5, 95], axis=0)
+        centers.append((lo + hi) / 2.0)
+        extents.append(np.maximum(hi - lo, 1e-6))
+    if centers:
+        centers_arr, extents_arr = np.asarray(centers), np.asarray(extents)
+        reference_extent = np.median(extents_arr, axis=0)
+        reference_diag = max(float(np.linalg.norm(reference_extent)), 1e-6)
+        center_stability = float(np.exp(-np.median(
+            np.linalg.norm(centers_arr - np.median(centers_arr, axis=0), axis=1)
+        ) / (0.20 * reference_diag)))
+        extent_error = np.median(
+            np.abs(extents_arr - reference_extent) / np.maximum(reference_extent, 1e-6)
+        )
+        extent_stability = float(np.exp(-extent_error / 0.35))
+    else:
+        center_stability = extent_stability = 0.0
+
+    pts_all = np.asarray(inst.get("pts", []), float)
+    pts_all = pts_all[np.isfinite(pts_all).all(axis=1)] if pts_all.ndim == 2 and pts_all.shape[1:] == (3,) else np.empty((0, 3))
+    vertical_planar = False
+    planarity = 0.0
+    if len(pts_all) >= 30:
+        centred = pts_all - np.median(pts_all, axis=0)
+        cov = np.cov(centred.T)
+        if np.isfinite(cov).all():
+            eigenvalues, eigenvectors = np.linalg.eigh(cov)
+            largest = max(float(eigenvalues[-1]), 1e-9)
+            thickness_ratio = max(float(eigenvalues[0]), 0.0) / largest
+            planarity = float(np.clip(1.0 - thickness_ratio / 0.08, 0.0, 1.0))
+            normal = eigenvectors[:, 0]
+            vertical_planar = planarity >= 0.75 and abs(float(normal[1])) <= 0.45
+
+    label = str(inst.get("label", "object"))
+    floor_gap = 0.0
+    if len(pts_all) and _label_has_word(label, _FLOOR_SUPPORT_WORDS):
+        floor_gap = max(0.0, float(np.percentile(pts_all[:, 1], 2) - floor_y))
+    floor_gap_ratio = floor_gap / max(float(room_height), 1e-6)
+    # Missing legs/support are common in monocular scans, so floor gap remains
+    # diagnostic but is not sufficient for rejection. A vertical sheet is a
+    # much stronger contradiction for an ordinarily volumetric category.
+    category_conflict = not _is_planar_physical_label(label) and vertical_planar
+
+    if reprojection is None:
+        geometry_score = float(np.clip(
+            0.50 * point_overlap + 0.25 * center_stability + 0.25 * extent_stability,
+            0.0, 1.0,
+        ))
+    else:
+        geometry_score = float(np.clip(
+            0.30 * point_overlap + 0.30 * reprojection +
+            0.20 * center_stability + 0.20 * extent_stability,
+            0.0, 1.0,
+        ))
+    multi_view_conflict = bool(
+        len(frames) >= 2 and point_overlap < 0.15 and
+        ((reprojection is not None and reprojection < 0.25) or center_stability < 0.50)
+    )
+    reflection_conflict = category_conflict or multi_view_conflict
+    reflection_score = (
+        float(np.clip(
+            0.55 * inside_ratio + 0.25 * float(reflection_conflict) +
+            0.20 * (1.0 - point_overlap), 0.0, 1.0,
+        )) if inside_ratio > 0 else 0.0
+    )
+    reject = bool(
+        len(frames) >= 2 and reflector_hits >= 2 and inside_ratio >= 0.70 and
+        reflection_conflict and reflection_score >= 0.65
+    )
+    status = "rejected_reflection" if reject else (
+        "uncertain" if inside_ratio >= 0.50 or len(frames) < 2 else "accepted"
+    )
+    return {
+        "status": status,
+        "geometry_score": round(geometry_score, 3),
+        "reflection_score": round(reflection_score, 3),
+        "point_overlap": round(point_overlap, 3),
+        "reprojection_agreement": (
+            round(float(reprojection), 3) if reprojection is not None else None
+        ),
+        "center_stability": round(center_stability, 3),
+        "extent_stability": round(extent_stability, 3),
+        "planarity": round(planarity, 3),
+        "vertical_planar": bool(vertical_planar),
+        "floor_gap": round(floor_gap, 4),
+        "floor_gap_ratio": round(floor_gap_ratio, 3),
+        "category_conflict": bool(category_conflict),
+        "multi_view_conflict": bool(multi_view_conflict),
+        "reflector_inside_ratio": round(inside_ratio, 3),
+        "reflector_frames": int(reflector_hits),
+        "reflector_labels": reflector_labels,
+        "frames": len(frames),
+        "reject": reject,
+    }
+
+
+def _filter_reflection_instances(instances: list[dict], floor_y: float,
+                                 room_height: float, **verification_context) -> tuple[list[dict], dict]:
+    kept, rejected = [], []
+    for inst in instances:
+        audit = _verify_instance_geometry(
+            inst, floor_y, room_height, **verification_context,
+        )
+        inst["geometry_verification"] = audit
+        if audit["reject"]:
+            rejected.append({
+                "label": str(inst.get("label", "object")),
+                "score": round(float(inst.get("score", 0.0)), 3),
+                "reason": "reflection",
+                "verification": audit,
+            })
+        else:
+            kept.append(inst)
+    return kept, {
+        "algorithm": "multiview-reflection-v1",
+        "evaluated": len(instances),
+        "accepted": len(kept),
+        "rejected": len(rejected),
+        "rejected_candidates": rejected,
+    }
 
 
 def _instances_are_split_track_duplicate(
@@ -461,11 +755,11 @@ def _instances_are_split_track_duplicate(
 ) -> bool:
     """Detect two association tracks occupying the same physical object.
 
-    This handles the common case where ambiguity protection starts a second
-    track in later frames: there is no shared 2-D frame for the normal duplicate
-    test, but the robust 3-D boxes almost coincide. Per-axis size agreement and
-    complete 3-D containment keep nested objects (monitor on desk) separate;
-    explicit same-frame separation protects adjacent repeated furniture.
+    This handles observations split by label changes or large centroid drift:
+    there is no shared 2-D frame for the normal duplicate test, but the robust
+    3-D boxes almost coincide. Per-axis size agreement and complete 3-D
+    containment keep nested objects (monitor on desk) separate; explicit
+    same-frame separation protects adjacent repeated furniture.
     """
     if _instances_have_same_frame_separation(a, b):
         return False
@@ -474,14 +768,27 @@ def _instances_are_split_track_duplicate(
     extent_a = np.maximum(hi_a - lo_a, 1e-6)
     extent_b = np.maximum(hi_b - lo_b, 1e-6)
     ratio = extent_a / extent_b
-    if np.any((ratio < 0.50) | (ratio > 2.0)):
-        return False
+    standard_size_match = not np.any((ratio < 0.50) | (ratio > 2.0))
+    relaxed_size_match = not np.any((ratio < 0.38) | (ratio > 2.6))
+    cloud_support = None
+    if not standard_size_match:
+        if not relaxed_size_match:
+            return False
+        cloud_support = _point_cloud_overlap_support(a, b)
+        if cloud_support[0] < 0.68 or cloud_support[1] < 0.28:
+            return False
 
     inter = np.maximum(np.minimum(hi_a, hi_b) - np.maximum(lo_a, lo_b), 0.0)
     vol_a, vol_b = float(np.prod(extent_a)), float(np.prod(extent_b))
     containment = float(np.prod(inter) / max(min(vol_a, vol_b), 1e-9))
+    # Strong direct cloud agreement permits a less complete bounding-volume
+    # overlap, which is common when two camera arcs see opposite object sides.
     if containment < min_containment:
-        return False
+        if containment < 0.48:
+            return False
+        cloud_support = cloud_support or _point_cloud_overlap_support(a, b)
+        if cloud_support[0] < 0.48 or cloud_support[1] < 0.20:
+            return False
 
     center_a, center_b = (lo_a + hi_a) / 2.0, (lo_b + hi_b) / 2.0
     scale = max(float(np.linalg.norm(extent_a)), float(np.linalg.norm(extent_b)), 1e-6)
@@ -527,12 +834,27 @@ def _merge_cross_label_duplicates(instances: list[dict]) -> list[dict]:
 # Same-frame boxes above this IoU are one object detected twice (a repeated
 # grounding); below it they are distinct objects the detector already separated.
 _DUP_BOX_IOU = 0.5
+# Only very low overlap is positive evidence of two different objects. The
+# interval between this and _DUP_BOX_IOU is deliberately ambiguous: different
+# phrases frequently produce a tight and a broad box for the same object, and
+# their shared 3-D point support should be allowed to settle the decision.
+_DISTINCT_BOX_MAX_IOU = 0.15
 
 
-def _observation_extent(obs: dict) -> np.ndarray:
-    pts = np.asarray(obs["pts"])
-    return np.maximum(np.percentile(pts, 95, axis=0) -
-                      np.percentile(pts, 5, axis=0), 1e-6)
+def _same_frame_distinct(a: dict, b: dict) -> bool:
+    """Whether two detections are clearly separate objects in one image."""
+    if a.get("box") is None or b.get("box") is None:
+        return False
+    # A reflected candidate and the physical surface containing it are not two
+    # labels for one object. Their boxes are nested by definition, so ordinary
+    # low-IoU separation cannot protect them from cross-label consolidation.
+    a_reflector = _is_reflector_label(str(a.get("label", "")))
+    b_reflector = _is_reflector_label(str(b.get("label", "")))
+    if a_reflector != b_reflector:
+        contained = b if a_reflector else a
+        if float(contained.get("reflector_inside_ratio", 0.0)) >= 0.50:
+            return True
+    return box_iou(a["box"], b["box"]) <= _DISTINCT_BOX_MAX_IOU
 
 
 def _same_frame_duplicate(a: dict, b: dict) -> bool:
@@ -545,151 +867,64 @@ def _same_frame_duplicate(a: dict, b: dict) -> bool:
     return np.linalg.norm(np.asarray(a["center"]) - np.asarray(b["center"])) <= 0.35 * scale
 
 
-def _frame_tracklets(frame_obs: list[dict]) -> list[dict]:
-    """Make same-frame atomic observations while retaining label evidence.
-
-    A tracklet may contain repeated, near-identical boxes (including different
-    phrases) but never two detections the detector drew as separate objects.
-    Complete-link grouping prevents an overlap chain from joining neighbours.
-    """
-    groups: list[list[dict]] = []
-    ordered = sorted(frame_obs, key=lambda o: (-o.get("n_raw", len(o["pts"])), -o["score"]))
-    for obs in ordered:
-        target = next((group for group in groups
-                       if all(_same_frame_duplicate(obs, member) for member in group)), None)
-        if target is None:
-            groups.append([obs])
-        else:
-            target.append(obs)
-
-    tracklets = []
-    for group in groups:
-        tracklets.append({
-            "frame": group[0]["frame"],
-            "members": group,
-            "center": np.median([o["center"] for o in group], axis=0),
-            "diag": float(np.median([o["diag"] for o in group])),
-            "extent": np.median([_observation_extent(o) for o in group], axis=0),
-            "labels": {str(o["label"]).lower().strip() for o in group},
-            "score": max(float(o["score"]) for o in group),
-        })
-    return tracklets
-
-
-def _cluster_stats(cluster: dict) -> tuple[np.ndarray, float, np.ndarray, float]:
-    tracklets = cluster["tracklets"]
-    centers = np.asarray([t["center"] for t in tracklets])
-    center = np.median(centers, axis=0)
-    diag = float(np.median([t["diag"] for t in tracklets]))
-    extent = np.median([t["extent"] for t in tracklets], axis=0)
-    jitter = float(np.median(np.linalg.norm(centers - center, axis=1))) if len(centers) > 1 else 0.0
-    return center, max(diag, 1e-6), np.maximum(extent, 1e-6), jitter
-
-
-def _association_cost(tracklet: dict, cluster: dict) -> float:
-    """Dimensionless compatibility; infinity means the pairing is unsafe."""
-    center, diag, extent, jitter = _cluster_stats(cluster)
-    distance = float(np.linalg.norm(np.asarray(tracklet["center"]) - center))
-    scale = max(diag, float(tracklet["diag"]), 1e-6)
-    norm_distance = distance / scale
-
-    # A stable multi-view track gets a tight gate. A one-view seed gets enough
-    # slack for partial-mask centroid drift, but not the old 0.6× scene-wide
-    # radius that swallowed adjacent repeated objects.
-    if len(cluster["tracklets"]) >= 2:
-        max_norm_distance = max(0.28, 3.0 * jitter / scale)
-    else:
-        max_norm_distance = 0.50
-    if norm_distance > min(max_norm_distance, 0.55):
-        return float("inf")
-
-    ratio = np.maximum(tracklet["extent"], 1e-6) / extent
-    if np.any((ratio < 0.28) | (ratio > 3.5)):
-        return float("inf")
-    size_cost = float(np.median(np.abs(np.log(ratio))))
-    if size_cost > 0.85:
-        return float("inf")
-
-    cluster_labels = set().union(*(t["labels"] for t in cluster["tracklets"]))
-    label_penalty = 0.0 if tracklet["labels"] & cluster_labels else 0.12
-    return norm_distance + 0.20 * size_cost + label_penalty
-
-
-def _associate_tracklets(frames: dict[int, list[dict]]) -> list[dict]:
-    """Constrained global association, independent of category labels."""
-    # Start with the frame containing the strongest object-count evidence.
-    order = sorted(frames, key=lambda f: (
-        -len(frames[f]), -sum(t["score"] for t in frames[f]), f,
-    ))
-    clusters = [{"tracklets": [t]} for t in frames[order[0]]]
-
-    for frame in order[1:]:
-        pending = frames[frame]
-        if not pending:
-            continue
-        costs = np.array([[_association_cost(t, c) for c in clusters] for t in pending])
-        assigned_rows: set[int] = set()
-        assigned_cols: set[int] = set()
-
-        # Accept only reciprocal best matches. Sorting by cost makes the result
-        # deterministic and prevents a later ambiguous edge from stealing a
-        # stronger identity match.
-        candidates = []
-        for r in range(len(pending)):
-            finite = np.flatnonzero(np.isfinite(costs[r]))
-            if not len(finite):
-                continue
-            c = int(finite[np.argmin(costs[r, finite])])
-            col_finite = np.flatnonzero(np.isfinite(costs[:, c]))
-            if not len(col_finite) or r != int(col_finite[np.argmin(costs[col_finite, c])]):
-                continue
-            best = float(costs[r, c])
-            row_alternatives = [float(costs[r, j]) for j in finite if j != c]
-            col_alternatives = [float(costs[i, c]) for i in col_finite if i != r]
-            # Close alternatives mean identity is ambiguous. Seed a temporary
-            # extra track rather than making an irreversible wrong merge.
-            if ((row_alternatives and min(row_alternatives) < best + 0.06) or
-                    (col_alternatives and min(col_alternatives) < best + 0.06)):
-                continue
-            candidates.append((best, r, c))
-        for _, r, c in sorted(candidates):
-            if r in assigned_rows or c in assigned_cols:
-                continue
-            clusters[c]["tracklets"].append(pending[r])
-            assigned_rows.add(r)
-            assigned_cols.add(c)
-        for r, tracklet in enumerate(pending):
-            if r not in assigned_rows:
-                clusters.append({"tracklets": [tracklet]})
-    return clusters
-
-
 def cluster_observations(observations: list[dict]) -> list[dict]:
-    """Constrained, label-independent multi-frame object association.
+    """Original merge-oriented clustering with one same-frame safeguard.
 
-    Labels are selected only after physical instances are formed. Same-frame
-    separate boxes are hard cannot-link evidence; cross-frame links must be
-    reciprocal, size-compatible, and increasingly close as a track stabilizes.
+    Nearby observations with the same label use the original broad, scale-free
+    radius. This intentionally favors one stable instance over fragmented
+    tracks. The only added cannot-link rule is direct detector evidence: two
+    clearly separate boxes in the same frame may never enter the same group.
     """
     from collections import defaultdict
 
-    if not observations:
-        return []
-    by_frame: dict[int, list[dict]] = defaultdict(list)
+    by_label: dict[str, list[dict]] = defaultdict(list)
     for o in observations:
-        by_frame[o["frame"]].append(o)
-    frames = {frame: _frame_tracklets(obs) for frame, obs in by_frame.items()}
+        by_label[o["label"]].append(o)
 
     instances = []
-    for cluster in _associate_tracklets(frames):
-        members = [obs for tracklet in cluster["tracklets"] for obs in tracklet["members"]]
-        frames_seen = {obs["frame"] for obs in members}
-        # Retain strong one-view objects regardless of which frame seeded them.
-        # This deliberately errs toward an editable extra candidate instead of
-        # silently dropping a real object that only one camera angle exposed.
-        if len(frames_seen) < 2 and max(obs["score"] for obs in members) < 0.50:
-            continue
-        instances.append(_instance_from_observations(members))
+    for _, label_obs in by_label.items():
+        ordered = sorted(label_obs, key=lambda o: -o["score"])
+        used = [False] * len(ordered)
+        for i, seed in enumerate(ordered):
+            if used[i]:
+                continue
+            group = [seed]
+            used[i] = True
+            # The original implementation consumed candidates in list order.
+            # With several identical chairs that could attach a nearby chair
+            # before the same chair's much closer observation in that frame.
+            # Preserve the broad merge radius, but consume nearest observations
+            # first so the same-frame cannot-link protects the correct identity.
+            candidates = sorted(
+                range(i + 1, len(ordered)),
+                key=lambda j: float(np.linalg.norm(
+                    seed["center"] - ordered[j]["center"]
+                )),
+            )
+            for j in candidates:
+                if used[j]:
+                    continue
+                candidate = ordered[j]
+                threshold = 0.6 * max(seed["diag"], candidate["diag"], 1e-6)
+                if np.linalg.norm(seed["center"] - candidate["center"]) >= threshold:
+                    continue
+                if any(
+                    member["frame"] == candidate["frame"] and
+                    _same_frame_distinct(member, candidate)
+                    for member in group
+                ):
+                    continue
+                group.append(candidate)
+                used[j] = True
+
+            frames_seen = {obs["frame"] for obs in group}
+            if len(frames_seen) < 2 and max(obs["score"] for obs in group) < 0.45:
+                continue
+            instances.append(_instance_from_observations(group))
+
+    # Same-label clustering intentionally mirrors the known-good first version.
+    # This conservative pass handles any fragments left by label changes or
+    # unusually large point-cloud drift.
     consolidated = _merge_cross_label_duplicates(instances)
     if len(consolidated) < len(instances):
         print(
@@ -761,6 +996,107 @@ def place_instance(inst: dict, floor_y: float, room_yaw: float,
         "yaw": float(yaw),
         "size": [max(w, 0.02), h, max(d, 0.02)],
     }
+
+
+def _placement_aabb(placement: dict) -> tuple[np.ndarray, np.ndarray]:
+    """World-axis bounds of the oriented box shown by the scene editor."""
+    x, y, z = np.asarray(placement["position"], float)
+    w, h, d = np.maximum(np.asarray(placement["size"], float), 1e-6)
+    yaw = float(placement.get("yaw", 0.0))
+    c, s = np.cos(yaw), np.sin(yaw)
+    local = np.array([[-w / 2, -d / 2], [w / 2, -d / 2],
+                      [w / 2, d / 2], [-w / 2, d / 2]])
+    world_xz = local @ np.array([[c, s], [-s, c]]) + [x, z]
+    lo = np.array([world_xz[:, 0].min(), y, world_xz[:, 1].min()])
+    hi = np.array([world_xz[:, 0].max(), y + h, world_xz[:, 1].max()])
+    return lo, hi
+
+
+def _placed_are_duplicate(a: dict, b: dict,
+                          min_containment: float = 0.72) -> bool:
+    """Whether two final editor placements are duplicate representations.
+
+    This is deliberately later than track association: floor snapping, robust
+    extents and yaw are now applied, so it catches objects that will visibly
+    overlap even when their partial raw point bounds differed. Same-frame
+    separation remains a hard veto, and comparable dimensions prevent a small
+    nested object from disappearing into its support furniture.
+    """
+    if _instances_have_same_frame_separation(a, b):
+        return False
+    pa, pb = a["placement"], b["placement"]
+    sa = np.asarray(pa["size"], float)
+    sb = np.asarray(pb["size"], float)
+    # Width/depth may swap when two partial scans choose yaws 90 degrees apart.
+    footprint_a, footprint_b = np.sort(sa[[0, 2]]), np.sort(sb[[0, 2]])
+    footprint_ratio = footprint_a / np.maximum(footprint_b, 1e-6)
+    height_ratio = sa[1] / max(sb[1], 1e-6)
+    comparable = (
+        np.all((footprint_ratio >= 0.50) & (footprint_ratio <= 2.0)) and
+        0.50 <= height_ratio <= 2.0
+    )
+    relaxed_size = (
+        np.all((footprint_ratio >= 0.38) & (footprint_ratio <= 2.6)) and
+        0.38 <= height_ratio <= 2.6
+    )
+    cloud_support = None
+    if not comparable:
+        if not relaxed_size:
+            return False
+        cloud_support = _point_cloud_overlap_support(a, b)
+        if cloud_support[0] < 0.68 or cloud_support[1] < 0.28:
+            return False
+
+    lo_a, hi_a = _placement_aabb(pa)
+    lo_b, hi_b = _placement_aabb(pb)
+    extent_a, extent_b = hi_a - lo_a, hi_b - lo_b
+    inter = np.maximum(np.minimum(hi_a, hi_b) - np.maximum(lo_a, lo_b), 0.0)
+    vol_a, vol_b = float(np.prod(extent_a)), float(np.prod(extent_b))
+    containment = float(np.prod(inter) / max(min(vol_a, vol_b), 1e-9))
+    if containment < min_containment:
+        if containment < 0.52:
+            return False
+        cloud_support = cloud_support or _point_cloud_overlap_support(a, b)
+        if cloud_support[0] < 0.48 or cloud_support[1] < 0.20:
+            return False
+    center_a, center_b = (lo_a + hi_a) / 2, (lo_b + hi_b) / 2
+    scale = max(float(np.linalg.norm(extent_a)), float(np.linalg.norm(extent_b)), 1e-6)
+    return float(np.linalg.norm(center_a - center_b) / scale) <= 0.25
+
+
+def _consolidate_overlapping_placements(
+    instances: list[dict],
+    floor_y: float,
+    room_yaw: float,
+    floor_snap_tol: float,
+) -> list[dict]:
+    """Merge complete-link groups that would strongly overlap in the editor."""
+    provisional = [
+        {**inst, "placement": place_instance(inst, floor_y, room_yaw, floor_snap_tol)}
+        for inst in instances
+    ]
+    ordered = sorted(
+        provisional,
+        key=lambda p: (p["frames_seen"], p["score"], len(p["pts"])),
+        reverse=True,
+    )
+    used = [False] * len(ordered)
+    result = []
+    for i, base in enumerate(ordered):
+        if used[i]:
+            continue
+        group = [base]
+        used[i] = True
+        for j in range(i + 1, len(ordered)):
+            if used[j] or not all(_placed_are_duplicate(member, ordered[j]) for member in group):
+                continue
+            group.append(ordered[j])
+            used[j] = True
+        observations = [
+            obs for member in group for obs in member.get("_observations", [])
+        ]
+        result.append(_instance_from_observations(observations) if observations else base)
+    return result
 
 
 # ── Metric calibration ────────────────────────────────────────────────────────
@@ -1192,6 +1528,135 @@ def _save_object_photo(image_paths: list[str], inst: dict, scene_dir: str,
     return rel
 
 
+def _select_object_support_observation(
+    inst: dict,
+    image_paths: list[str],
+    masks: list,
+    image_cache: dict[int, np.ndarray | None] | None = None,
+) -> tuple[dict | None, dict]:
+    """Choose the observation that best represents this final placed object.
+
+    Raw mask size alone is unsafe after track consolidation: a broad grounding
+    box can contain more points while actually framing a neighbour. Candidates
+    are scored by point support inside the final editor bounds, 3-D centre
+    agreement, detector confidence, mask availability, sharpness, and whether
+    the box is clipped by the frame. Invalid candidates are skipped so another
+    supporting frame can still provide the editor photo and TRELLIS crop.
+    """
+    cache = image_cache if image_cache is not None else {}
+    observations = list(inst.get("_observations", []))
+    if not observations:
+        return None, {"reason": "no_observations"}
+    # Cross-label consolidation deliberately pools geometry from compatible
+    # detections, but a losing label can frame a neighbour or a larger parent
+    # object. Keep the image/TRELLIS evidence label-scoped whenever possible;
+    # only fall back to all observations for legacy instances whose reviewed
+    # label no longer appears verbatim in their detector evidence.
+    final_label = str(inst.get("label", "")).lower().strip()
+    label_observations = [
+        obs for obs in observations
+        if str(obs.get("label", "")).lower().strip() == final_label
+    ]
+    label_scoped = bool(label_observations)
+    if label_scoped:
+        observations = label_observations
+    placement = inst.get("placement")
+    if placement is not None:
+        target_lo, target_hi = _placement_aabb(placement)
+        pad = 0.12 * np.maximum(target_hi - target_lo, 1e-6)
+        target_lo, target_hi = target_lo - pad, target_hi + pad
+        target_center = (target_lo + target_hi) / 2.0
+        target_diag = max(float(np.linalg.norm(target_hi - target_lo)), 1e-6)
+    else:
+        target_lo, target_hi = _instance_bounds(inst)
+        target_center = (target_lo + target_hi) / 2.0
+        target_diag = max(float(np.linalg.norm(target_hi - target_lo)), 1e-6)
+
+    ranked = []
+    for obs in observations:
+        fi, box = obs.get("frame"), obs.get("box")
+        if not isinstance(fi, (int, np.integer)) or not (0 <= int(fi) < len(image_paths)):
+            continue
+        if box is None or np.asarray(box).size != 4 or not np.isfinite(box).all():
+            continue
+        fi = int(fi)
+        if fi not in cache:
+            cache[fi] = cv2.imread(image_paths[fi])
+        image = cache[fi]
+        if image is None:
+            continue
+        H, W = image.shape[:2]
+        x1f, y1f, x2f, y2f = map(float, box)
+        x1, y1 = int(max(x1f, 0)), int(max(y1f, 0))
+        x2, y2 = int(min(x2f, W)), int(min(y2f, H))
+        if x2 - x1 < 4 or y2 - y1 < 4:
+            continue
+
+        pts = np.asarray(obs.get("pts", []), float)
+        finite = np.isfinite(pts).all(axis=1) if pts.ndim == 2 and pts.shape[1:] == (3,) else np.zeros(0, bool)
+        pts = pts[finite] if len(finite) else np.empty((0, 3))
+        support = float(np.mean(np.all((pts >= target_lo) & (pts <= target_hi), axis=1))) if len(pts) else 0.0
+        obs_center = np.asarray(obs.get("center", target_center), float)
+        center_score = max(0.0, 1.0 - float(np.linalg.norm(obs_center - target_center)) / (0.6 * target_diag))
+
+        crop_gray = cv2.cvtColor(image[y1:y2, x1:x2], cv2.COLOR_BGR2GRAY)
+        sharpness = float(cv2.Laplacian(crop_gray, cv2.CV_64F).var())
+        sharpness_score = min(np.log1p(max(sharpness, 0.0)) / 7.0, 1.0)
+        det_score = float(np.clip(obs.get("score", 0.0), 0.0, 1.0))
+        clipped = x1f <= 1 or y1f <= 1 or x2f >= W - 1 or y2f >= H - 1
+        di = obs.get("det_idx")
+        has_mask = (
+            isinstance(di, (int, np.integer)) and fi < len(masks) and
+            0 <= int(di) < len(masks[fi]) and masks[fi][int(di)] is not None
+        )
+        label_match = str(obs.get("label", "")).lower().strip() == str(inst.get("label", "")).lower().strip()
+        quality = (
+            0.42 * support + 0.23 * center_score + 0.12 * det_score +
+            0.10 * sharpness_score + 0.08 * float(has_mask) +
+            0.05 * float(label_match) - 0.08 * float(clipped)
+        )
+        ranked.append((quality, obs, {
+            "frame": fi,
+            "score": round(float(quality), 3),
+            "point_support": round(support, 3),
+            "center_agreement": round(center_score, 3),
+            "sharpness": round(sharpness_score, 3),
+            "has_mask": bool(has_mask),
+            "clipped": bool(clipped),
+            "label_scoped": label_scoped,
+            "candidates": 0,
+        }))
+
+    if not ranked:
+        return None, {"reason": "no_valid_image_observation", "candidates": 0}
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    audit = ranked[0][2]
+    audit["candidates"] = len(ranked)
+    return ranked[0][1], audit
+
+
+def _refresh_object_support_images(
+    placed: list[dict], image_paths: list[str], masks: list,
+) -> dict:
+    """Refresh best-frame fields after all association/review/placement steps."""
+    cache: dict[int, np.ndarray | None] = {}
+    selected, missing = 0, 0
+    for inst in placed:
+        obs, audit = _select_object_support_observation(inst, image_paths, masks, cache)
+        inst["photo_selection"] = audit
+        if obs is None:
+            inst["best_frame"] = None
+            inst["best_box"] = None
+            inst["best_det_idx"] = None
+            missing += 1
+            continue
+        inst["best_frame"] = int(obs["frame"])
+        inst["best_box"] = np.asarray(obs["box"], float)
+        inst["best_det_idx"] = obs.get("det_idx")
+        selected += 1
+    return {"selected": selected, "missing": missing}
+
+
 # ── Duplicate grouping (asset reuse) ─────────────────────────────────────────
 
 def _group_duplicates(placed: list[dict], size_rel_tol: float = 0.15) -> list[list[int]]:
@@ -1237,6 +1702,125 @@ def _group_duplicates(placed: list[dict], size_rel_tol: float = 0.15) -> list[li
                     group.append(idxs[b])
                     used[b] = True
             groups.append(group)
+    return groups
+
+
+def _masked_crop_appearance_descriptor(crop: np.ndarray | None) -> dict | None:
+    """Compact, dependency-free descriptor for conservative asset reuse.
+
+    This is intentionally stricter than object tracking. Two physical objects
+    may share a label and metric size while having different upholstery, shape,
+    or controls. Only an RGBA crop with a useful SAM foreground is accepted;
+    uncertain/maskless comparisons remain separate and get their own asset.
+    """
+    if crop is None or crop.ndim != 3 or crop.shape[2] != 4:
+        return None
+    alpha = np.asarray(crop[:, :, 3], np.uint8)
+    mask = alpha >= 128
+    if mask.sum() < 64 or mask.all():
+        return None
+    ys, xs = np.nonzero(mask)
+    y1, y2, x1, x2 = ys.min(), ys.max() + 1, xs.min(), xs.max() + 1
+    rgb = np.asarray(crop[y1:y2, x1:x2, :3], np.uint8)
+    tight_mask = mask[y1:y2, x1:x2]
+    if min(rgb.shape[:2]) < 2:
+        return None
+
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    hist = cv2.calcHist(
+        [hsv], [0, 1, 2], tight_mask.astype(np.uint8),
+        [12, 4, 4], [0, 180, 0, 256, 0, 256],
+    ).reshape(-1).astype(np.float32)
+    hist_sum = float(hist.sum())
+    if hist_sum <= 0:
+        return None
+    # Square-rooted probabilities make the dot product a bounded Hellinger
+    # similarity and reduce sensitivity to illumination/exposure changes.
+    hist = np.sqrt(hist / hist_sum)
+
+    side, inner = 48, 44
+    h, w = rgb.shape[:2]
+    scale = inner / max(h, w)
+    rh, rw = max(1, int(round(h * scale))), max(1, int(round(w * scale)))
+    resized_rgb = cv2.resize(rgb, (rw, rh), interpolation=cv2.INTER_AREA)
+    resized_mask = cv2.resize(
+        tight_mask.astype(np.uint8), (rw, rh), interpolation=cv2.INTER_NEAREST,
+    ).astype(bool)
+    y0, x0 = (side - rh) // 2, (side - rw) // 2
+    thumb = np.zeros((side, side, 3), np.uint8)
+    silhouette = np.zeros((side, side), bool)
+    thumb[y0:y0 + rh, x0:x0 + rw] = resized_rgb
+    silhouette[y0:y0 + rh, x0:x0 + rw] = resized_mask
+    thumb[~silhouette] = 0
+    gray = cv2.cvtColor(thumb, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, 40, 120) > 0
+    edges &= cv2.dilate(silhouette.astype(np.uint8), np.ones((3, 3), np.uint8)).astype(bool)
+    return {
+        "hist": hist,
+        "thumb": thumb,
+        "silhouette": silhouette,
+        "edges": edges,
+    }
+
+
+def _appearance_similarity(a: dict | None, b: dict | None) -> float:
+    """Return conservative [0, 1] similarity between two masked object crops."""
+    if a is None or b is None:
+        return 0.0
+    color = float(np.clip(np.dot(a["hist"], b["hist"]), 0.0, 1.0))
+    union = a["silhouette"] | b["silhouette"]
+    if not union.any():
+        return 0.0
+    shape = float(np.sum(a["silhouette"] & b["silhouette"]) / np.sum(union))
+    pixel_delta = np.abs(
+        a["thumb"].astype(np.float32) - b["thumb"].astype(np.float32)
+    ).mean(axis=2)
+    texture = float(1.0 - np.mean(pixel_delta[union]) / 255.0)
+    edge_union = a["edges"] | b["edges"]
+    edge = (
+        float(np.sum(a["edges"] & b["edges"]) / np.sum(edge_union))
+        if edge_union.any() else 1.0
+    )
+    return float(np.clip(0.40 * color + 0.25 * texture + 0.20 * shape + 0.15 * edge,
+                         0.0, 1.0))
+
+
+def _group_reusable_assets(
+    placed: list[dict], image_paths: list[str], masks: list,
+    size_rel_tol: float = 0.10, min_appearance_similarity: float = 0.90,
+) -> list[list[int]]:
+    """Group only objects safe to render with the same generated/scan asset.
+
+    Label and metric extent provide a cheap coarse filter. Every proposed group
+    must then form a visual clique: each member's SAM crop must agree with every
+    existing member. Missing or ambiguous masks fail closed to singleton groups.
+    """
+    coarse_groups = _group_duplicates(placed, size_rel_tol=size_rel_tol)
+    descriptors: dict[int, dict | None] = {}
+    for i, inst in enumerate(placed):
+        descriptor = _masked_crop_appearance_descriptor(
+            _object_crop_rgb(image_paths, masks, inst)
+        )
+        descriptors[i] = descriptor
+        inst["_asset_appearance_descriptor"] = descriptor
+
+    groups: list[list[int]] = []
+    for coarse in coarse_groups:
+        visual_groups: list[list[int]] = []
+        for idx in coarse:
+            matched = False
+            for group in visual_groups:
+                similarities = [
+                    _appearance_similarity(descriptors[idx], descriptors[member])
+                    for member in group
+                ]
+                if similarities and min(similarities) >= min_appearance_similarity:
+                    group.append(idx)
+                    matched = True
+                    break
+            if not matched:
+                visual_groups.append([idx])
+        groups.extend(visual_groups)
     return groups
 
 
@@ -1538,16 +2122,43 @@ def _ray_wall_cells(camera_local: np.ndarray, endpoints_local: np.ndarray,
 
 def _classify_wall_cells(observed: np.ndarray, occluded_views: np.ndarray,
                          semantic_opening: np.ndarray, through_views: np.ndarray,
-                         min_through_views: int = 2) -> np.ndarray:
-    """Cells safe to fill: object-occluded, unsupported by real wall points,
-    and not protected by semantic or multi-view through-wall evidence."""
-    from scipy.ndimage import binary_dilation
+                         min_through_views: int = 2,
+                         complete_unknown: bool = False) -> np.ndarray:
+    """Classify missing wall cells that are safe to complete.
+
+    Object-occluded cells are always eligible. When a real wall plane has
+    enough support, ``complete_unknown`` also fills unsupported cells connected
+    to that observed plane. Semantic openings and repeated rays continuing
+    beyond the wall remain hard exclusions in both modes.
+    """
+    from scipy.ndimage import binary_dilation, binary_propagation
 
     observed = binary_dilation(np.asarray(observed, bool), iterations=1)
     occluded = binary_dilation(np.asarray(occluded_views) > 0, iterations=1)
     opening = np.asarray(semantic_opening, bool) | (np.asarray(through_views) >= min_through_views)
     opening = binary_dilation(opening, iterations=1)
-    return occluded & ~observed & ~opening
+    eligible = occluded
+    if complete_unknown and observed.any():
+        # Flood only across the established wall surface. An opening spanning
+        # the grid acts as a barrier instead of allowing invented geometry on
+        # an unsupported region beyond it.
+        connected_wall = binary_propagation(observed, mask=~opening)
+        eligible = eligible | connected_wall
+    return eligible & ~observed & ~opening
+
+
+def _wall_plane_supported(observed: np.ndarray,
+                          min_cells: int = 6) -> bool:
+    """Whether real points establish a 2-D wall patch rather than an edge.
+
+    Requiring support across both wall axes rejects floor-wall seams and single
+    depth streaks, while still allowing a mostly dark or occluded wall to be
+    completed from a small genuine patch.
+    """
+    cells = np.argwhere(np.asarray(observed, bool))
+    if len(cells) < max(int(min_cells), 1):
+        return False
+    return len(np.unique(cells[:, 0])) >= 2 and len(np.unique(cells[:, 1])) >= 2
 
 
 def _sample_mask_points_local(mask: np.ndarray, points_frame: np.ndarray,
@@ -1590,6 +2201,9 @@ def _wall_infill_evidence(
     for spec in specs:
         shape = _wall_grid_shape(spec, ceil_h)
         near = np.abs(glob_local[:, spec["axis"]] - spec["plane"]) <= wall_tol
+        # Do not let a dense floor/ceiling seam falsely establish a wall plane.
+        near &= ((glob_local[:, 1] > 0.05 * ceil_h) &
+                 (glob_local[:, 1] < 0.95 * ceil_h))
         observed = np.zeros(shape, bool)
         iy, iu = _points_to_wall_cells(glob_local[near], spec, ceil_h, shape)
         observed[iy, iu] = True
@@ -1652,9 +2266,11 @@ def _wall_infill_evidence(
                     ev[key] += frame_cells.astype(np.uint16)
 
     for ev in evidence:
+        ev["plane_supported"] = _wall_plane_supported(ev["observed"])
         ev["fill"] = _classify_wall_cells(
             ev["observed"], ev["occluded_views"],
             ev["semantic_opening"], ev["through_views"],
+            complete_unknown=ev["plane_supported"],
         )
     return evidence
 
@@ -1682,18 +2298,135 @@ def _mask_rectangles(mask: np.ndarray) -> list[tuple[int, int, int, int]]:
     return rectangles
 
 
+def _wall_color_field(
+    spec: dict,
+    images: np.ndarray,
+    world_pts: np.ndarray,
+    sample_px: np.ndarray,
+    T_total: np.ndarray,
+    scale: float,
+    offset: np.ndarray,
+    R: np.ndarray,
+    ceil_h: float,
+    shape: tuple[int, int],
+    fallback_color,
+    wall_tol: float,
+    min_points_per_view: int = 2,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Locally varying wall colour field, mirroring _horizontal_color_field.
+
+    Each frame contributes one mean RGB sample per supported grid cell, from
+    points lying within `wall_tol` of this wall's plane — so a completed patch
+    carries real captured wall texture sampled near it, not one flat colour
+    for the whole wall. Missing cells use inverse-distance interpolation from
+    up to four nearest observed neighbours, extending nearby real appearance.
+
+    Returns (colors, observed_color_cells) where colors is (ny, nu, 3).
+    """
+    ny, nu = shape
+    samples: list[list[np.ndarray]] = [[] for _ in range(ny * nu)]
+
+    for fi in range(min(len(images), len(world_pts), len(sample_px))):
+        sel = np.asarray(sample_px[fi], bool)
+        if not sel.any():
+            continue
+        pts = _apply44(T_total, world_pts[fi][sel]) * scale + offset
+        pts = pts @ R.T
+        cols = np.transpose(images[fi], (1, 2, 0))[sel]
+        if np.issubdtype(cols.dtype, np.floating):
+            cols = cols * (255.0 if len(cols) and float(np.nanmax(cols)) <= 1.5 else 1.0)
+        cols = np.asarray(cols, np.float64)
+        u, y = pts[:, spec["u_axis"]], pts[:, 1]
+        valid = (
+            np.isfinite(pts).all(axis=1) & np.isfinite(cols).all(axis=1) &
+            (np.abs(pts[:, spec["axis"]] - spec["plane"]) <= wall_tol) &
+            (u >= spec["u_min"]) & (u <= spec["u_max"]) &
+            (y >= 0.0) & (y <= ceil_h)
+        )
+        if not valid.any():
+            continue
+        uv, yv, colsv = u[valid], y[valid], cols[valid]
+        iu = np.clip(np.floor((uv - spec["u_min"]) /
+                              max(spec["u_max"] - spec["u_min"], 1e-9) * nu).astype(int), 0, nu - 1)
+        iy = np.clip(np.floor(yv / max(ceil_h, 1e-9) * ny).astype(int), 0, ny - 1)
+        cell = iy * nu + iu
+        order = np.argsort(cell)
+        cell, colsv = cell[order], colsv[order]
+        ids, starts, counts = np.unique(cell, return_index=True, return_counts=True)
+        sums = np.add.reduceat(colsv, starts, axis=0)
+        for cid, total, count in zip(ids, sums, counts):
+            if count >= max(int(min_points_per_view), 1):
+                samples[int(cid)].append(total / count)
+
+    fallback = np.asarray(fallback_color, np.float64)[:3]
+    field = np.tile(fallback, (ny, nu, 1))
+    observed = np.zeros((ny, nu), bool)
+    for cid, values in enumerate(samples):
+        if values:
+            iy, iu = divmod(cid, nu)
+            field[iy, iu] = np.median(np.asarray(values), axis=0)
+            observed[iy, iu] = True
+
+    if observed.any() and not observed.all():
+        from scipy.spatial import cKDTree
+
+        known = np.argwhere(observed)
+        unknown = np.argwhere(~observed)
+        k = min(4, len(known))
+        distances, indices = cKDTree(known).query(unknown, k=k)
+        distances = np.asarray(distances).reshape(len(unknown), k)
+        indices = np.asarray(indices).reshape(len(unknown), k)
+        weights = 1.0 / np.maximum(distances, 0.75) ** 2
+        neighbour_colors = field[known[indices, 0], known[indices, 1]]
+        interpolated = np.sum(neighbour_colors * weights[..., None], axis=1)
+        interpolated /= np.sum(weights, axis=1, keepdims=True)
+        field[unknown[:, 0], unknown[:, 1]] = interpolated
+
+    return np.clip(field, 0, 255).astype(np.uint8), observed
+
+
 def _wall_fill_mesh(index: int, fill: np.ndarray,
                     rect: tuple[float, float, float, float], ceil_h: float,
-                    R: np.ndarray, color, thickness: float = 0.02,
+                    R: np.ndarray, color, color_field: np.ndarray | None = None,
+                    thickness: float = 0.02,
                     gap: float = 0.01) -> trimesh.Trimesh | None:
+    """Create backing patches for missing wall cells.
+
+    With `color_field` each cell becomes its own thin coloured box carrying
+    locally sampled real wall texture (see _wall_color_field), instead of one
+    flat colour for every patch. A solid box — not a single-sided plane —
+    keeps the inward-facing side correctly coloured regardless of winding, the
+    same guarantee _oriented_box already gives every other wall/box mesh here.
+    The legacy flat-colour path remains for callers without image evidence and
+    merges contiguous cells into fewer, larger boxes.
+    """
     spec = _wall_spec(index, rect)
     ny, nu = fill.shape
+    center_axis = spec["plane"] + spec["sign"] * (gap + thickness / 2)
+
+    if color_field is not None:
+        colors = np.asarray(color_field)
+        if colors.shape != (ny, nu, 3):
+            raise ValueError(f"color_field shape {colors.shape} != {(ny, nu, 3)}")
+        meshes = []
+        for iy, iu in np.argwhere(fill):
+            ya, yb = iy / ny * ceil_h, (iy + 1) / ny * ceil_h
+            ua = spec["u_min"] + iu / nu * (spec["u_max"] - spec["u_min"])
+            ub = spec["u_min"] + (iu + 1) / nu * (spec["u_max"] - spec["u_min"])
+            if spec["axis"] == 0:
+                extents = [thickness, yb - ya, ub - ua]
+                center = [center_axis, (ya + yb) / 2, (ua + ub) / 2]
+            else:
+                extents = [ub - ua, yb - ya, thickness]
+                center = [(ua + ub) / 2, (ya + yb) / 2, center_axis]
+            meshes.append(_oriented_box(extents, center, colors[iy, iu].tolist(), R))
+        return trimesh.util.concatenate(meshes) if meshes else None
+
     meshes = []
     for y0, y1, u0, u1 in _mask_rectangles(fill):
         ya, yb = y0 / ny * ceil_h, y1 / ny * ceil_h
         ua = spec["u_min"] + u0 / nu * (spec["u_max"] - spec["u_min"])
         ub = spec["u_min"] + u1 / nu * (spec["u_max"] - spec["u_min"])
-        center_axis = spec["plane"] + spec["sign"] * (gap + thickness / 2)
         if spec["axis"] == 0:
             extents = [thickness, yb - ya, ub - ua]
             center = [center_axis, (ya + yb) / 2, (ua + ub) / 2]
@@ -1943,6 +2676,48 @@ def _export_raw_scan(points_m: np.ndarray, colors: np.ndarray, path: str,
     return int(len(pts))
 
 
+def _object_fit_points(inst: dict, scale: float, offset: np.ndarray,
+                       max_points: int = 384) -> list[list[float]]:
+    """Return a compact scan sample in the editor object's local frame.
+
+    These points are retained solely for fitting a later replacement GLB. They
+    are voxel-deduplicated so repeatedly observed surfaces do not overwhelm a
+    less frequently visible side, and clipped to the placement with a little
+    tolerance to remove obvious background/support-surface leakage.
+    """
+    placement = inst["placement"]
+    size = np.asarray(placement["size"], float) * scale
+    position = np.asarray(placement["position"], float) * scale + offset
+    points = np.asarray(inst.get("pts", []), float) * scale + offset
+    if points.ndim != 2 or points.shape[1:] != (3,) or len(points) == 0:
+        return []
+
+    yaw = float(placement.get("yaw", 0.0))
+    c, s = np.cos(-yaw), np.sin(-yaw)
+    rotation = np.array([[c, 0, -s], [0, 1, 0], [s, 0, c]])
+    local = (points - position) @ rotation.T
+    local = local[np.isfinite(local).all(axis=1)]
+    pad = size * np.array([0.15, 0.10, 0.15])
+    keep = (
+        (np.abs(local[:, 0]) <= size[0] / 2 + pad[0])
+        & (local[:, 1] >= -pad[1])
+        & (local[:, 1] <= size[1] + pad[1])
+        & (np.abs(local[:, 2]) <= size[2] / 2 + pad[2])
+    )
+    local = local[keep]
+    if len(local) == 0:
+        return []
+
+    voxel = max(float(np.linalg.norm(size)) / 70.0, 1e-5)
+    keys = np.floor(local / voxel).astype(np.int64)
+    _, unique_idx = np.unique(keys, axis=0, return_index=True)
+    local = local[np.sort(unique_idx)]
+    if len(local) > max_points:
+        take = np.linspace(0, len(local) - 1, max_points).astype(np.int64)
+        local = local[take]
+    return np.round(local, 4).tolist()
+
+
 def _carve_room_shell(bg: trimesh.Trimesh, R: np.ndarray,
                       rect: tuple[float, float, float, float],
                       ceil_h: float, pad: float = 0.2) -> trimesh.Trimesh:
@@ -1996,15 +2771,16 @@ def build_scene(
     wasn't enough real scan geometry — turning those into a generated asset
     (source "trellis"). Real scan geometry is still preferred whenever present.
     Pairs naturally with reuse_duplicates: the generator then runs once per
-    duplicate group (see modal_app.py's generate_object_glb container).
+    visually verified reusable-asset group (see modal_app.py's
+    generate_object_glb container).
 
-    reuse_duplicates: when True, instances that share a label and match in
-    metric size are grouped, one asset is built per group, and the other
-    members reference that same glb with a per-instance model_scale/model_offset
-    (the same fit contract the editor's "Replace Model" upload already uses).
-    Only geometry is shared — each object keeps its own position/yaw. Off by
-    default: the per-instance scan mesh stays the faithful default; reuse trades
-    that for cross-object consistency and one build per duplicate group.
+    reuse_duplicates: when True, instances must share a label, match closely in
+    metric size, and pass a conservative masked-crop appearance comparison. One
+    asset is built per verified group, and other members reference that GLB with
+    per-instance model_scale/model_offset. Missing/uncertain SAM evidence fails
+    closed to separate assets. Only geometry is shared — each object keeps its
+    own position/yaw. Off by default: per-instance meshes remain the faithful
+    default; reuse trades some build time for verified cross-object consistency.
 
     abort_check, if given, is called between stages and per-frame/per-object
     inside the two slowest loops (SAM segmentation, mesh building) — it should
@@ -2041,6 +2817,16 @@ def build_scene(
         if fi >= S:
             break
         color_hwc = np.transpose(images[fi], (1, 2, 0))
+        reflector_masks: list[tuple[str, np.ndarray]] = []
+        for rbi, reflector_label in enumerate(frame["labels"]):
+            if (not _is_reflector_label(str(reflector_label)) or
+                    rbi >= len(masks[fi]) or masks[fi][rbi] is None):
+                continue
+            reflector_masks.append((
+                str(reflector_label),
+                cv2.resize(masks[fi][rbi].astype(np.uint8), (dW, dH),
+                           interpolation=cv2.INTER_NEAREST).astype(bool),
+            ))
         for bi, (label, score) in enumerate(zip(frame["labels"], frame["scores"])):
             if bi >= len(masks[fi]) or masks[fi][bi] is None:
                 continue
@@ -2054,11 +2840,20 @@ def build_scene(
             sel = m_small & good_px[fi]
             if sel.sum() < 30:
                 continue
+            inside_ratio, enclosing_labels = 0.0, []
+            if not _is_reflector_label(str(label)):
+                for reflector_label, reflector_mask in reflector_masks:
+                    ratio = float(np.sum(m_small & reflector_mask) / max(np.sum(m_small), 1))
+                    if ratio >= 0.50:
+                        enclosing_labels.append(reflector_label)
+                    inside_ratio = max(inside_ratio, ratio)
             pts = _apply44(T_align, world_pts[fi][sel])
             cols = (color_hwc[sel] * 255).clip(0, 255).astype(np.uint8)
             observations.append(_make_observation(str(label), float(score), fi, pts, cols,
                                                   box=np.asarray(frame["boxes"][bi]),
-                                                  det_idx=bi))
+                                                  det_idx=bi,
+                                                  reflector_inside_ratio=inside_ratio,
+                                                  reflector_labels=enclosing_labels))
             exclude_mask[fi] |= cv2.dilate(m_small.astype(np.uint8),
                                            np.ones((3, 3), np.uint8)).astype(bool)
 
@@ -2102,10 +2897,21 @@ def build_scene(
 
     # ── 3. Cluster into instances, place them ────────────────────────────────
     instances = cluster_observations(observations)
+    clustered_count = len(instances)
+    instances = _consolidate_overlapping_placements(
+        instances, floor_y, room_yaw, floor_snap_tol=room_h * 0.12
+    )
+    if len(instances) < clustered_count:
+        print(
+            f"[SceneBuilder] Editor-overlap consolidation: {clustered_count} objects → "
+            f"{len(instances)} physical objects."
+        )
     print(f"[SceneBuilder] {len(instances)} object instance(s) after clustering.")
     association_summary = {
-        "algorithm": "constrained-label-independent-v1",
+        "algorithm": "merge-oriented-same-label-v1",
         "observations": len(observations),
+        "instances_before_editor_overlap_check": clustered_count,
+        "instances_after_editor_overlap_check": len(instances),
         "instances_before_review": len(instances),
         "multi_view_instances": sum(inst.get("frames_seen", 0) >= 2 for inst in instances),
         "single_view_instances": sum(inst.get("frames_seen", 0) < 2 for inst in instances),
@@ -2136,11 +2942,35 @@ def build_scene(
             print(f"[SceneBuilder] Gemini label review failed; keeping detector labels ({exc}).")
     association_summary["instances_after_review"] = len(instances)
 
+    # Reflection filtering is deliberately after optional semantic relabeling:
+    # geometry profiles should use the final category, not a detector synonym.
+    instances, reflection_summary = _filter_reflection_instances(
+        instances, floor_y, room_h, T_total=T_total, extrinsic=extrinsic,
+        intrinsic=intrinsic, depth=depth, masks=masks,
+    )
+    association_summary["reflection_verification"] = reflection_summary
+    association_summary["instances_after_reflection_check"] = len(instances)
+    if reflection_summary["rejected"]:
+        print(
+            f"[SceneBuilder] Reflection verification rejected "
+            f"{reflection_summary['rejected']} candidate(s)."
+        )
+    # Always rebuild this after all semantic and geometric rejection. Otherwise
+    # a discarded reflected object would still carve a hole in the background.
+    exclude_mask = _exclude_mask_for_instances(instances, masks, (S, dH, dW))
+
     placed = []
     for inst in instances:
         placement = place_instance(inst, floor_y, room_yaw,
                                    floor_snap_tol=room_h * 0.12)
         placed.append({**inst, "placement": placement})
+    photo_selection_summary = _refresh_object_support_images(placed, image_paths, masks)
+    association_summary["support_images"] = photo_selection_summary
+    if photo_selection_summary["missing"]:
+        print(
+            f"[SceneBuilder] Support images: {photo_selection_summary['selected']} selected, "
+            f"{photo_selection_summary['missing']} missing valid frame evidence."
+        )
 
     # ── 4. Metric scale ───────────────────────────────────────────────────────
     if manual_scale:
@@ -2207,12 +3037,15 @@ def build_scene(
             aligned_raw, np.vstack(raw_cols), os.path.join(scene_dir, "raw_scan.glb")
         )
 
-    # ── 5b. Group duplicates so identical objects share one built asset ───────
-    # Off by default (every instance is its own group). When enabled, one mesh
-    # is built per (label, size) group and the rest reference it through
-    # model_scale/model_offset — the same fit contract the editor's
-    # "Replace Model" upload already applies (index.html loadObjectMesh).
-    groups = _group_duplicates(placed) if reuse_duplicates else [[i] for i in range(len(placed))]
+    # ── 5b. Group visually equivalent objects for safe asset reuse ────────────
+    # Off by default (every instance is its own group). When enabled, label and
+    # size provide a coarse filter, then masked-crop appearance must agree. The
+    # rest reference one verified mesh through model_scale/model_offset — the
+    # same fit contract the editor's "Replace Model" upload applies.
+    groups = (
+        _group_reusable_assets(placed, image_paths, masks)
+        if reuse_duplicates else [[i] for i in range(len(placed))]
+    )
     rep_of: dict[int, int] = {}
     for g in groups:
         # Representative = the best-supported instance (most frames, then score,
@@ -2346,6 +3179,9 @@ def build_scene(
             "size": [round(v, 4) for v in size_m],
             "glb": glb_rel,
         }
+        fit_points = _object_fit_points(p, scale, offset)
+        if fit_points:
+            entry["fit_points"] = fit_points
         if rep == i:
             entry["source"] = rep_source
         else:
@@ -2361,6 +3197,11 @@ def build_scene(
                                      round(float(-lo_b[1]), 5),
                                      round(float(-center[2]), 5)]
             entry["model_scale"] = [round(float(size_m[k] / bbox[k]), 5) for k in range(3)]
+            similarity = _appearance_similarity(
+                p.get("_asset_appearance_descriptor"),
+                placed[rep].get("_asset_appearance_descriptor"),
+            )
+            entry["asset_reuse_similarity"] = round(similarity, 3)
 
         photo_rel = _save_object_photo(image_paths, p, scene_dir, obj_id)
         if photo_rel:
@@ -2374,6 +3215,10 @@ def build_scene(
             entry["original_label"] = p["original_label"]
         if p.get("label_review"):
             entry["label_review"] = p["label_review"]
+        if p.get("photo_selection"):
+            entry["photo_selection"] = p["photo_selection"]
+        if p.get("geometry_verification"):
+            entry["geometry_verification"] = p["geometry_verification"]
         objects_json.append(entry)
 
     # ── 6. Scan-preserving background + coverage-aware boundary fill ─────────
@@ -2465,26 +3310,40 @@ def build_scene(
                 _ensure_material(ceiling_patch), geom_name="ceiling_fill"
             )
 
-    # Walls: patch only grid cells whose camera rays were blocked by segmented
-    # objects. Door/window masks and multi-view depth continuing beyond a wall
-    # protect intentional openings from being closed.
+    # Walls: complete unsupported cells connected to an established real wall;
+    # walls without sufficient plane support stay in occlusion-only mode.
+    # Door/window masks and multi-view depth continuing beyond a wall protect
+    # intentional openings from being closed.
     wall_cols = tuple(np.array([floor_cols, ceil_cols]).mean(axis=0).astype(int))
+    wall_tol = max(0.04, 0.025 * max(min(xmax - xmin, zmax - zmin), 1e-6))
     wall_infill_summary = []
     for i, ev in enumerate(wall_evidence):
+        wall_color_field, wall_color_observed = _wall_color_field(
+            ev["spec"], images, world_pts, surface_sample_px, T_total, scale, offset, R,
+            ceil_h, ev["shape"], wall_cols, wall_tol,
+        )
         patch = _wall_fill_mesh(
-            i, ev["fill"], (xmin, xmax, zmin, zmax), ceil_h, R, wall_cols
+            i, ev["fill"], (xmin, xmax, zmin, zmax), ceil_h, R, wall_cols,
+            color_field=wall_color_field,
         )
         if patch is not None:
             room_scene.add_geometry(_ensure_material(patch), geom_name=f"wall_{i}_fill")
         wall_infill_summary.append({
             "wall": i,
             "grid": [int(ev["shape"][1]), int(ev["shape"][0])],
+            "plane_supported": bool(ev["plane_supported"]),
+            "completion_mode": (
+                "connected-complete-shell" if ev["plane_supported"]
+                else "occlusion-only"
+            ),
             "observed_cells": int(np.count_nonzero(ev["observed"])),
             "occluded_cells": int(np.count_nonzero(ev["occluded_views"])),
             "opening_cells": int(np.count_nonzero(
                 ev["semantic_opening"] | (ev["through_views"] >= 2)
             )),
             "filled_cells": int(np.count_nonzero(ev["fill"])),
+            "locally_colored_cells": int(np.count_nonzero(wall_color_observed)),
+            "appearance": "multi-view-local-interpolation-v1",
         })
 
     room_scene.export(os.path.join(scene_dir, "background.glb"))

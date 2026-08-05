@@ -13,6 +13,8 @@ from typing import Any
 
 from PIL import Image
 
+from src.detection.label_taxonomy import canonicalize_major_label
+
 
 _REVIEW_PROMPT = """Review these object detections from one indoor room scan.
 Each image is preceded by its numeric ID and Grounding DINO label. For every
@@ -42,12 +44,10 @@ _RESPONSE_SCHEMA = {
                     "reason": {"type": "string"},
                 },
                 "required": ["id", "action", "label", "confidence", "reason"],
-                "additionalProperties": False,
             },
         }
     },
     "required": ["decisions"],
-    "additionalProperties": False,
 }
 
 
@@ -121,6 +121,10 @@ def apply_review_decisions(
             })
             continue
         new_label = _clean_label(decision.get("label"))
+        if new_label:
+            # Collapse known synonyms without preventing a genuinely novel
+            # category from surviving the conservative review path.
+            new_label = canonicalize_major_label(new_label) or new_label
         if action == "relabel" and confidence >= relabel_threshold and new_label and new_label != old_label.lower():
             inst["original_label"] = old_label
             inst["label"] = new_label
