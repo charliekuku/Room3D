@@ -9,8 +9,10 @@ Powered by [VGGT-Omega](https://github.com/facebookresearch/vggt-omega) (CVPR 20
 ## Features
 
 - **Point cloud & mesh output** — point cloud, TSDF (watertight), or Poisson surface reconstruction
-- **Blueprint mode** — architectural wireframe view with floor/ceiling/wall detection and height-gradient colouring
 - **Object detection** — Grounding DINO back-projects detected objects (server racks, desks, monitors…) into 3D bounding boxes
+- **Editable hybrid scenes** — SAM segments detections into movable objects while the aligned raw scan remains available as an accuracy overlay; edit labels, compare Raw/Structured/Both, move and rotate objects, then save the layout
+- **Serverless GPU deploy** — `modal_app.py` runs the whole app on an L4 GPU on [Modal](https://modal.com), scaling to zero when idle
+- **Metric auto-calibration** — detected server racks (42U ≈ 2.0 m) anchor the scene to real-world metres
 - **Gemini Vision auto-labelling** — one click to detect what's in your scene and populate the detection prompt
 - **Video input** — sample frames from a walkthrough video instead of uploading individual photos
 - **Device-aware** — runs on CUDA, Apple MPS, or CPU; resolution and frame cap auto-adjusted to available memory
@@ -54,7 +56,7 @@ huggingface-cli login
 **4. Run:**
 
 ```bash
-python app.py
+python src/app.py
 # Opens at http://localhost:7860
 # The model (~4 GB) downloads automatically on first run.
 ```
@@ -90,13 +92,50 @@ cp .env.example .env
 ## Project structure
 
 ```
-app.py              # Gradio UI + inference pipeline
-tsdf_fusion.py      # TSDF and Poisson mesh reconstruction
+src/
+  app.py                        # Gradio UI + inference pipeline + FastAPI server (editor & scenes)
+  build_scene_cli.py            # Headless scene builder (video/photos → scenes/<name>/)
+  detection/scene_builder.py    # SAM segmentation → movable objects, rack calibration, GLB export
+  reconstruction/tsdf_fusion.py # TSDF and Poisson mesh reconstruction
+  viewer/editor/                # three.js scene editor (served at /editor/?scene=<name>)
+modal_app.py        # Serverless GPU deployment on Modal (CUDA L4)
+scenes/             # Built editable scenes (gitignored)
+tests/              # Phase tests (pytest tests/)
 setup.sh            # Clones vggt_omega_repo and installs deps
 requirements.txt    # App-level deps (heavy deps come from vggt_omega_repo)
 checkpoints/        # Model weights (gitignored — downloaded on first run)
 vggt_omega_repo/    # Upstream VGGT-Omega repo (gitignored — cloned by setup.sh)
 ```
+
+## Deploy to Modal (CUDA)
+
+One-time setup (secrets + weight caching) is documented at the top of [modal_app.py](modal_app.py). Then:
+
+```bash
+modal serve modal_app.py    # dev: temporary URL, hot-reloads src/ on save
+modal deploy modal_app.py   # prod: persistent URL, scales to zero when idle
+```
+
+## Editable scene workflow
+
+1. Run `python src/app.py`, upload a video or photos.
+2. Enable **Detect objects** (optionally auto-label with Gemini), tick **Build editable scene**, and reconstruct.
+3. The editor appears embedded below the status panel (or use the full-screen link): every
+   detected object is a separate, labeled, movable node — parametric prefabs for
+   racks/desks/monitors/chairs, or for everything else, a piece cut directly out of the
+   dense scanned mesh (falling back to an isolated reconstruction, then a plain box).
+   Observed room surfaces are preserved and synthetic backing fills only weakly scanned
+   boundaries. Use **View → Raw Scan / Structured / Both** to inspect alignment; hover an
+   object for its bounding box, point-support quality, label, and detection confidence.
+4. Edit labels or move (G) / rotate (R) objects, then **Save layout** — changes persist to
+   `scenes/<name>/scene.json`.
+
+Or headless: `python src/build_scene_cli.py data/office.mp4 --fps 1`
+
+How positions stay accurate: each object is placed from SAM-masked depth pixels aggregated
+across *all* frames it appears in (median centre, percentile extents), single-frame
+low-confidence detections are discarded, bases snap to the RANSAC-fitted floor plane, and
+yaw snaps to the room's 90° grid when close.
 
 ## License
 

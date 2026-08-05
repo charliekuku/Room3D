@@ -28,7 +28,12 @@ echo "[2/3] Installing Python dependencies…"
 
 pip install -r vggt_omega_repo/requirements.txt
 pip install -e vggt_omega_repo/          # editable install for the vggt_omega package
-pip install -r vggt_omega_repo/requirements_demo.txt
+
+# requirements_demo.txt minus onnxruntime: it only backs visual_util's sky-
+# segmentation feature, which app.py never enables (mask_sky is hardcoded
+# False — indoor scans don't need it) and is a sizeable, otherwise-unused dep.
+grep -v '^onnxruntime' vggt_omega_repo/requirements_demo.txt > vggt_omega_repo/requirements_demo_filtered.txt
+pip install -r vggt_omega_repo/requirements_demo_filtered.txt
 
 # 3. Install our app-level requirements
 echo "[3/3] Installing app requirements…"
@@ -44,7 +49,7 @@ echo "  3. The app will auto-download on first launch, OR manually:"
 echo "       huggingface-cli download facebook/VGGT-Omega vggt_omega_1b_512.pt --local-dir checkpoints"
 echo ""
 echo "Start the demo:"
-echo "  python app.py"
+echo "  python src/app.py"
 echo ""
 echo "Or point to a different checkpoint:"
-echo "  CHECKPOINT_PATH=path/to/model.pt python app.py"
+echo "  CHECKPOINT_PATH=path/to/model.pt python src/app.py"

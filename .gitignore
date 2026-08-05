@@ -5,7 +5,8 @@ checkpoints/
 vggt_omega_repo/
 
 # Python
-venv/
+venv
+venv.nosync/
 .venv/
 __pycache__/
 *.pyc
@@ -18,10 +19,15 @@ build/
 # Secrets
 .env
 
-# Sample / test data
+# Sample / test data (videos + photos, hundreds of MB)
 chess/
+data/
+
+# Legacy Blender experiment (pre-VGGT pipeline + .blend assets)
+blender/
 
 # Generated 3D outputs
+scenes/
 *.glb
 *.ply
 *.obj
