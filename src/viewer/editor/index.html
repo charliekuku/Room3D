@@ -101,8 +101,11 @@
   </div>
   <div id="viewport">
     <div id="toolbar">
+      <button id="btn-add-object" class="primary" title="Upload a new GLB object into this scene">Add Object…</button>
+      <input type="file" id="file-object-add" accept=".glb,model/gltf-binary" style="display:none;" />
       <button id="btn-move" class="active" title="Move (G)">Move</button>
       <button id="btn-rotate" title="Rotate (R)">Rotate</button>
+      <button id="btn-resize" title="Resize (S)">Resize</button>
       <button id="btn-camera" title="Toggle Orthographic Top-Down Blueprint (C)">3D Perspective</button>
       <button id="btn-measure" title="Measure Distance (D)">Measure</button>
       <label title="Compare the editable scene against the aligned VGGT scan">View
@@ -120,7 +123,7 @@
       <button id="btn-save" class="primary">Save layout</button>
     </div>
     <div id="help">
-      G Move · R Rotate · C Cam · D Measure · Esc Deselect<br/>
+      G Move · R Rotate · S Resize · C Cam · D Measure · Esc Deselect<br/>
       drag: orbit/pan · wheel: zoom · hover: inspect · click: select object
     </div>
     <div id="hover-tip"></div>
@@ -178,11 +181,14 @@ const labelReviewMeta = labelReview?.enabled
 $('scene-meta').innerHTML =
   `<b>${sceneData.name}</b>` +
   `<span class="badge ${sceneData.metric ? 'ok' : ''}">${sceneData.metric ? 'metric (calibrated)' : 'relative scale'}</span><br/>` +
-  `Room: ${[sceneData.room.width, sceneData.room.depth, sceneData.room.height].map(fmtDim).join('×')} ${unit[units]} · ${sceneData.objects.length} objects` +
+  `Room: ${[sceneData.room.width, sceneData.room.depth, sceneData.room.height].map(fmtDim).join('×')} ${unit[units]} · ` +
+  `<span id="object-count">${sceneData.objects.length}</span> objects` +
   labelReviewMeta;
 
 const listEl = $('objlist');
-for (const obj of sceneData.objects) {
+let onRowHover3D = null;          // wired up once the 3D scene exists
+
+function addObjectRow(obj) {
   const row = document.createElement('div');
   row.className = 'obj-row';
   row.id = 'row-' + obj.id;
@@ -193,7 +199,12 @@ for (const obj of sceneData.objects) {
   row.onpointerleave = () => onRowHover3D?.(null);
   listEl.appendChild(row);
 }
-let onRowHover3D = null;          // wired up once the 3D scene exists
+for (const obj of sceneData.objects) addObjectRow(obj);
+
+function updateObjectCount() {
+  const count = $('object-count');
+  if (count) count.textContent = sceneData.objects.length;
+}
 
 // ── Selection state + inspector (works with or without WebGL) ────────────────
 const byId = new Map(sceneData.objects.map((o) => [o.id, o]));
@@ -225,6 +236,9 @@ function refreshInspector() {
   const g = objectGroups.get(selectedId);
   const p = g ? g.position : { x: o.position[0], y: o.position[1], z: o.position[2] };
   const yaw = g ? -g.rotation.y : o.yaw;
+  const objectScale = g ? [g.scale.x, g.scale.y, g.scale.z]
+    : (o.editor_scale || [1, 1, 1]);
+  const displayedSize = o.size.map((v, i) => v * objectScale[i]);
   const quality = o.scan_quality;
   const qualityLine = quality
     ? `<br/>scan support ${(quality.support * 100).toFixed(0)}% · quality ${(quality.score * 100).toFixed(0)}%`
@@ -259,11 +273,18 @@ function refreshInspector() {
     `<span class="badge">${escapeHtml(o.source)}</span><br/>` +
     (o.photo ? `<img class="obj-photo" src="${base + o.photo}" alt="detected ${escapeHtml(o.label)}" ` +
                `title="Source photo this object was detected in" />` : '') +
-    `size ${o.size.map((v) => v.toFixed(2)).join(' × ')} ${unit[units]}<br/>` +
+    `size ${displayedSize.map((v) => v.toFixed(2)).join(' × ')} ${unit[units]}<br/>` +
     `pos (${p.x.toFixed(2)}, ${p.y.toFixed(2)}, ${p.z.toFixed(2)}) ${unit[units]} · ` +
     `yaw ${(yaw * 180 / Math.PI).toFixed(0)}°<br/>` +
-    `detected ${(o.score * 100).toFixed(0)}% · seen in ${o.frames_seen} frame(s)` +
+    (o.source === 'custom-upload' && !o.photo
+      ? `manual GLB · scale ${objectScale.map((v) => v.toFixed(2)).join(' × ')}`
+      : `detected ${((o.score || 0) * 100).toFixed(0)}% · seen in ${o.frames_seen || 0} frame(s)`) +
     qualityLine + reviewLine + reuseLine + verificationLine + modelFitLine;
+
+  $('btn-regen').disabled = !o.input_crop && !o.photo;
+  $('btn-regen').title = $('btn-regen').disabled
+    ? 'This manually uploaded object has no source image for TRELLIS.2'
+    : "Regenerate this object's mesh with TRELLIS.2 image-to-3D from its detected view";
 
   const labelInput = $('obj-label-input');
   labelInput.addEventListener('input', () => {
@@ -358,8 +379,18 @@ const gizmo = new TransformControls(camera, renderer.domElement);
 gizmo.addEventListener('dragging-changed', (e) => { activeOrbit.enabled = !e.value; });
 gizmo.addEventListener('objectChange', () => { 
   if (selectedId) {
+    const obj = byId.get(selectedId);
+    const group = objectGroups.get(selectedId);
+    if (mode === 'scale') {
+      group.scale.set(
+        THREE.MathUtils.clamp(Math.abs(group.scale.x), 0.01, 100),
+        THREE.MathUtils.clamp(Math.abs(group.scale.y), 0.01, 100),
+        THREE.MathUtils.clamp(Math.abs(group.scale.z), 0.01, 100),
+      );
+      syncObjectScaleUI(obj, group);
+    }
     if ($('chk-floor').checked) {
-      objectGroups.get(selectedId).position.y = 0.0; // Snap bottom to leveled floor
+      group.position.y = 0.0; // Snap bottom to leveled floor
     }
     checkCollisions();
     refreshInspector(); 
@@ -415,6 +446,7 @@ function makeLabel(text, size) {
   // label sized for a 2m rack would dwarf a detected object a few cm across.
   const s = Math.min(Math.max(Math.max(...size) * 0.3, 0.02), 0.4);
   sprite.scale.set((w / 72) * s, s, 1);
+  sprite.userData.baseScale = sprite.scale.clone();
   sprite.position.y = size[1] + s * 0.7;
   sprite.renderOrder = 999;
   labelSprites.push(sprite);
@@ -436,6 +468,7 @@ function updateObjectLabelSprite(obj) {
   sprite.visible = $('chk-labels').checked;
   group.userData.labelSprite = sprite;
   group.add(sprite);
+  syncObjectScaleUI(obj, group);
 }
 
 // Helper to calculate stable deterministic mock temperatures
@@ -533,11 +566,29 @@ function applyViewMode() {
 }
 viewModeSelect.onchange = applyViewMode;
 
-for (const obj of sceneData.objects) {
+function syncObjectScaleUI(obj, group) {
+  const sprite = group.userData.labelSprite;
+  const baseScale = sprite?.userData.baseScale;
+  if (sprite && baseScale) {
+    sprite.scale.set(
+      baseScale.x / group.scale.x,
+      baseScale.y / group.scale.y,
+      baseScale.z / group.scale.z,
+    );
+  }
+  const rowDims = $('row-' + obj.id)?.querySelector('.dims');
+  if (rowDims) {
+    const scaled = obj.size.map((v, i) => v * [group.scale.x, group.scale.y, group.scale.z][i]);
+    rowDims.textContent = `${scaled.map(fmtDim).join('×')}${unit[units]}`;
+  }
+}
+
+function addObjectToScene(obj) {
   const group = new THREE.Group();
   group.name = obj.id;
   group.position.fromArray(obj.position);
   group.rotation.y = -obj.yaw;
+  group.scale.fromArray(obj.editor_scale || [1, 1, 1]);
   group.userData.object = obj;
   scene.add(group);
   objectGroups.set(obj.id, group);
@@ -560,7 +611,10 @@ for (const obj of sceneData.objects) {
   group.add(labelSprite);
 
   loadObjectMesh(obj, group);
+  syncObjectScaleUI(obj, group);
+  return group;
 }
+for (const obj of sceneData.objects) addObjectToScene(obj);
 
 // Each object's loaded mesh lives in its own sub-group (scaled independently
 // of the label/hover-box siblings) so a replacement upload can be scaled to
@@ -644,12 +698,13 @@ function checkCollisions() {
   const activeObj = objectGroups.get(selectedId);
   
   // Calculate raw box boundaries
-  const activeBox = new THREE.Box3().setFromObject(activeObj);
+  const activeBounds = hoverBoxes.get(selectedId) || activeObj;
+  const activeBox = new THREE.Box3().setFromObject(activeBounds);
   let collision = false;
 
   for (const [id, obj] of objectGroups.entries()) {
     if (id === selectedId) continue;
-    const otherBox = new THREE.Box3().setFromObject(obj);
+    const otherBox = new THREE.Box3().setFromObject(hoverBoxes.get(id) || obj);
     if (activeBox.intersectsBox(otherBox)) {
       collision = true;
       break;
@@ -955,19 +1010,24 @@ function applyMode() {
   if (mode === 'translate') {
     const lock = $('chk-floor').checked;
     gizmo.showX = true; gizmo.showZ = true; gizmo.showY = !lock;
-  } else {
+  } else if (mode === 'rotate') {
     gizmo.showX = false; gizmo.showZ = false; gizmo.showY = true;
+  } else {
+    gizmo.showX = true; gizmo.showY = true; gizmo.showZ = true;
   }
   $('btn-move').classList.toggle('active', mode === 'translate');
   $('btn-rotate').classList.toggle('active', mode === 'rotate');
+  $('btn-resize').classList.toggle('active', mode === 'scale');
 }
 $('btn-move').onclick = () => { mode = 'translate'; applyMode(); };
 $('btn-rotate').onclick = () => { mode = 'rotate'; applyMode(); };
+$('btn-resize').onclick = () => { mode = 'scale'; applyMode(); };
 $('chk-floor').onchange = applyMode;
 function applySnap() {
   const on = $('chk-snap').checked;
   gizmo.setTranslationSnap(on ? 0.1 : null);
   gizmo.setRotationSnap(on ? THREE.MathUtils.degToRad(15) : null);
+  gizmo.setScaleSnap(on ? 0.1 : null);
 }
 $('chk-snap').onchange = applySnap;
 applySnap();
@@ -979,6 +1039,7 @@ window.addEventListener('keydown', (e) => {
   if (e.target.tagName === 'INPUT') return;
   if (e.key === 'g' || e.key === 'm') { mode = 'translate'; applyMode(); }
   if (e.key === 'r') { mode = 'rotate'; applyMode(); }
+  if (e.key === 's') { mode = 'scale'; applyMode(); }
   if (e.key === 'c') { $('btn-camera').click(); }
   if (e.key === 'd') { $('btn-measure').click(); }
   if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) deleteSelectedObject();
@@ -1006,6 +1067,9 @@ async function deleteSelectedObject() {
   select(null);
   const group = objectGroups.get(id);
   if (group) {
+    const sprite = group.userData.labelSprite;
+    const spriteIndex = labelSprites.indexOf(sprite);
+    if (spriteIndex >= 0) labelSprites.splice(spriteIndex, 1);
     scene.remove(group);
     group.traverse((n) => {
       if (n.isMesh) { n.geometry?.dispose(); n.material?.dispose(); }
@@ -1017,6 +1081,7 @@ async function deleteSelectedObject() {
   byId.delete(id);
   sceneData.objects = sceneData.objects.filter((o) => o.id !== id);
   $('row-' + id)?.remove();
+  updateObjectCount();
   toast('Object deleted ✓');
 }
 $('btn-delete-obj').onclick = deleteSelectedObject;
@@ -1061,6 +1126,48 @@ $('btn-regen').onclick = async () => {
 };
 
 // ── Replace model ─────────────────────────────────────────────────────────────
+$('btn-add-object').onclick = () => $('file-object-add').click();
+
+$('file-object-add').onchange = async (e) => {
+  const file = e.target.files[0];
+  e.target.value = '';
+  if (!file) return;
+  const button = $('btn-add-object');
+  const oldText = button.textContent;
+  button.disabled = true;
+  button.textContent = 'Uploading…';
+  const inferredLabel = file.name.replace(/\.glb$/i, '').replace(/[_-]+/g, ' ').trim() || 'New object';
+  const form = new FormData();
+  form.append('file', file);
+  form.append('label', inferredLabel.slice(0, 100));
+
+  try {
+    const response = await fetch(`/api/scenes/${sceneName}/objects`, {
+      method: 'POST', body: form,
+    });
+    const result = await response.json().catch(() => ({}));
+    if (!response.ok || !result.object) {
+      toast(`Add failed — ${result.error || response.status}`);
+      return;
+    }
+    const obj = result.object;
+    sceneData.objects.push(obj);
+    byId.set(obj.id, obj);
+    addObjectRow(obj);
+    addObjectToScene(obj);
+    updateObjectCount();
+    select(obj.id);
+    mode = 'translate';
+    applyMode();
+    toast('Object added — move, rotate or resize it, then save ✓', 5000);
+  } catch (err) {
+    toast('Add failed — is app.py server running?');
+  } finally {
+    button.disabled = false;
+    button.textContent = oldText;
+  }
+};
+
 $('btn-replace-model').onclick = () => $('file-model-upload').click();
 
 $('file-model-upload').onchange = (e) => {
@@ -1132,6 +1239,8 @@ $('btn-save').onclick = async () => {
       label: obj.label.trim(),
       position: g ? [g.position.x, g.position.y, g.position.z] : obj.position,
       yaw: g ? -g.rotation.y : obj.yaw,
+      editor_scale: g ? [g.scale.x, g.scale.y, g.scale.z]
+        : (obj.editor_scale || [1, 1, 1]),
     };
   });
   if (objects.some((obj) => !obj.label)) {

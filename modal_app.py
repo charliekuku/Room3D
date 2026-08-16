@@ -173,6 +173,11 @@ trellis_image = (
         f"Trellis2ImageTo3DPipeline; print('TRELLIS.2 pipeline import OK')\"",
         gpu="L4",
     )
+    # setup.sh installs an unconstrained transformers release through its
+    # --basic requirements. Pin AFTER that expensive CUDA build layer so its
+    # transitive upgrade cannot replace the DINOv3-compatible version, and a
+    # future pin change does not force all six extensions to recompile.
+    .pip_install("transformers==4.57.3")
     .add_local_dir("src", remote_path=f"{APP_ROOT}/src")
 )
 
@@ -186,8 +191,9 @@ trellis_image = (
     max_containers=1,  # keep the ~10-12 GB 4B weights warm across a scene's objects
 )
 def generate_object_glb(crop_rgb) -> bytes | None:
-    """Generate a textured GLB from one object crop (numpy RGB). Returns GLB
-    bytes, or None on OOM/failure so the caller keeps its prefab/box fallback."""
+    """Generate a textured GLB from one numpy RGB/RGBA image. RGBA foreground
+    alpha is preserved; ordinary photos are masked automatically by BiRefNet.
+    Returns bytes, or None on OOM/failure so scene builds keep their fallback."""
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
@@ -197,6 +203,46 @@ def generate_object_glb(crop_rgb) -> bytes | None:
     data = mod.generate_glb_from_image(crop_rgb)
     trellis_hf_vol.commit()  # persist the 4B weights after first-run download
     return data
+
+
+@app.local_entrypoint()
+def trellis_upload(image_path: str, output_path: str = "output.glb",
+                   max_image_size: int = 2048):
+    """Upload an ordinary local photo to the deployed TRELLIS function.
+
+    Example:
+      modal run modal_app.py::trellis_upload \
+        --image-path data/chair.jpg --output-path chair.glb
+    """
+    from pathlib import Path
+
+    import numpy as np
+    from PIL import Image, ImageOps
+
+    source = Path(image_path).expanduser()
+    destination = Path(output_path).expanduser()
+    if not source.is_file():
+        raise FileNotFoundError(f"input image not found: {source}")
+    if max_image_size < 64 or max_image_size > 4096:
+        raise ValueError("max_image_size must be between 64 and 4096")
+
+    with Image.open(source) as opened:
+        image = ImageOps.exif_transpose(opened)
+        carries_alpha = "A" in image.getbands() or "transparency" in image.info
+        image = image.convert("RGBA" if carries_alpha else "RGB")
+        image.thumbnail((max_image_size, max_image_size), Image.Resampling.LANCZOS)
+        array = np.asarray(image, dtype=np.uint8)
+
+    print(
+        f"Uploading {source} ({image.width}×{image.height}, {image.mode}) to "
+        "room3d::generate_object_glb…"
+    )
+    glb_bytes = generate_object_glb.remote(array)
+    if not glb_bytes:
+        raise RuntimeError("TRELLIS returned no GLB; inspect `modal app logs room3d`")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(glb_bytes)
+    print(f"Saved {len(glb_bytes) / 1_000_000:.1f} MB to {destination.resolve()}")
 
 
 @app.function(

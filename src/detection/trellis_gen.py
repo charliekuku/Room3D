@@ -31,28 +31,62 @@ import numpy as np
 _pipeline = None
 
 
-class _AlphaOnlyBackgroundRemover:
-    """Stand-in for TRELLIS.2's eagerly-created local BiRefNet.
+class _AutoBackgroundRemover:
+    """TRELLIS-compatible, ungated BiRefNet foreground extractor.
 
-    Room3D supplies the foreground mask as the input image's alpha channel, so
-    TRELLIS.2's ``preprocess_image`` never needs to call a background-removal
-    model.  Upstream nevertheless constructs BiRefNet while loading the
-    pipeline, which downloads the separately gated briaai/RMBG-2.0 weights.
-    Replacing that constructor with this device-compatible stand-in avoids the
-    unused download.  Calling it is an error: maskless inputs are rejected
-    before the pipeline is loaded instead of silently using an uncut photo.
+    Some TRELLIS.2 revisions configure a gated BRIA repository in pipeline.json.
+    Room3D deliberately ignores that configured model name and uses the official
+    MIT-licensed ``ZhengPeng7/BiRefNet`` checkpoint instead. TRELLIS's low-VRAM
+    preprocessing moves this model to CUDA only while producing alpha, then
+    returns it to CPU before the much larger 3D models run.
     """
 
+    MODEL_NAME = "ZhengPeng7/BiRefNet"
+
     def __init__(self, *args, **kwargs):
-        pass
+        import torch
+        from torchvision import transforms
+        from transformers import AutoModelForImageSegmentation
+
+        print(f"[TRELLIS] Loading background remover {self.MODEL_NAME}…", flush=True)
+        self.model = AutoModelForImageSegmentation.from_pretrained(
+            self.MODEL_NAME, trust_remote_code=True,
+        ).eval()
+        self.transform = transforms.Compose([
+            transforms.Resize((1024, 1024)),
+            transforms.ToTensor(),
+            transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+        ])
+        self.device = torch.device("cpu")
 
     def to(self, device):
+        import torch
+
+        self.device = torch.device(device)
+        self.model.to(self.device)
         return self
 
+    def cuda(self):
+        return self.to("cuda")
+
+    def cpu(self):
+        return self.to("cpu")
+
     def __call__(self, image):
-        raise RuntimeError(
-            "Room3D TRELLIS generation requires an RGBA input with a foreground mask"
+        import torch
+        from PIL import Image
+        from torchvision import transforms
+
+        original = image.convert("RGB")
+        tensor = self.transform(original).unsqueeze(0).to(self.device)
+        with torch.inference_mode():
+            prediction = self.model(tensor)[-1].sigmoid()[0].squeeze().float().cpu()
+        mask = transforms.ToPILImage()(prediction).resize(
+            original.size, resample=Image.Resampling.BILINEAR,
         )
+        result = original.convert("RGBA")
+        result.putalpha(mask)
+        return result
 
 
 def _has_foreground_alpha(arr: np.ndarray) -> bool:
@@ -61,6 +95,33 @@ def _has_foreground_alpha(arr: np.ndarray) -> bool:
         return False
     alpha = arr[:, :, 3]
     return bool(np.any(alpha > 0) and np.any(alpha < 255))
+
+
+def _prepare_input_image(arr: np.ndarray):
+    """Convert an RGB/RGBA array into the PIL mode TRELLIS should preprocess.
+
+    A useful existing alpha mask is preserved. RGB and fully opaque RGBA inputs
+    are passed without alpha, which asks TRELLIS to run BiRefNet automatically.
+    Fully transparent inputs are invalid because they contain no foreground.
+    """
+    from PIL import Image
+
+    arr = np.asarray(arr)
+    if arr.dtype != np.uint8:
+        if np.issubdtype(arr.dtype, np.floating) and arr.size and np.nanmax(arr) <= 1.0:
+            arr = arr * 255.0
+        arr = np.nan_to_num(arr, nan=0.0, posinf=255.0, neginf=0.0).clip(0, 255).astype(np.uint8)
+    arr = np.ascontiguousarray(arr)
+    if arr.ndim != 3 or arr.shape[2] not in (3, 4) or min(arr.shape[:2]) < 2:
+        raise ValueError("input image must be an H×W RGB or RGBA array")
+    if arr.shape[2] == 4:
+        alpha = arr[:, :, 3]
+        if not np.any(alpha > 0):
+            raise ValueError("input image is fully transparent")
+        if _has_foreground_alpha(arr):
+            return Image.fromarray(arr), "provided-alpha"
+        arr = arr[:, :, :3]
+    return Image.fromarray(arr), "automatic-birefnet"
 
 
 def _get_pipeline():
@@ -99,13 +160,13 @@ def _get_pipeline():
                 f"{transformers.__version__}. Rebuild the Modal image."
             )
 
-        # Trellis2ImageTo3DPipeline.from_pretrained looks up the configured
-        # remover as getattr(rembg, "BiRefNet") and instantiates it eagerly.
-        # Room3D already has a SAM mask, so substitute a no-download stand-in.
-        rembg_module.BiRefNet = _AlphaOnlyBackgroundRemover
+        # Force an ungated remover even when an older cached TRELLIS checkout's
+        # pipeline.json names the gated BRIA model. The wrapper intentionally
+        # ignores constructor model-name arguments.
+        rembg_module.BiRefNet = _AutoBackgroundRemover
 
         print(f"[TRELLIS] Loading TRELLIS.2-4B (transformers {transformers.__version__}; "
-              "using Room3D SAM alpha; local RMBG disabled)…", flush=True)
+              "SAM alpha or automatic BiRefNet background removal)…", flush=True)
         _pipeline = Trellis2ImageTo3DPipeline.from_pretrained("microsoft/TRELLIS.2-4B")
         _pipeline.cuda()
         print("[TRELLIS] Ready.", flush=True)
@@ -117,26 +178,20 @@ def generate_glb_from_image(
     decimation_target: int = 200_000,
     texture_size: int = 1024,
 ) -> bytes | None:
-    """Generate a textured GLB from an RGBA crop whose alpha is the SAM mask.
+    """Generate a textured GLB from an RGB photo or masked RGBA crop.
 
     Returns GLB bytes, or None on CUDA OOM / any failure so the caller can fall
-    back to its prefab/box mesh. An RGBA crop carries a clean subject cutout, so
-    TRELLIS uses that alpha as the foreground mask instead of re-running its own
-    background removal on a box that may contain neighbouring clutter. Inputs
-    without a useful alpha mask are declined because local RMBG is intentionally
-    disabled; the caller retains its existing prefab/box fallback.
+    back to its prefab/box mesh. A useful RGBA alpha mask is used directly;
+    ordinary RGB/JPG and fully opaque PNG inputs are automatically segmented by
+    the ungated BiRefNet remover before TRELLIS inference.
     """
     import torch
-    from PIL import Image
     import o_voxel
 
     started = time.perf_counter()
     try:
-        arr = np.ascontiguousarray(crop_rgb)
-        if not _has_foreground_alpha(arr):
-            print("[TRELLIS] No usable SAM alpha mask; keeping fallback mesh.", flush=True)
-            return None
-        image = Image.fromarray(arr, mode="RGBA")
+        image, masking = _prepare_input_image(crop_rgb)
+        print(f"[TRELLIS] Input {image.size[0]}×{image.size[1]}; mask={masking}.", flush=True)
         pipeline_started = time.perf_counter()
         pipeline = _get_pipeline()
         pipeline_ready = time.perf_counter()
