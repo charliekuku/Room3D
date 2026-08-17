@@ -8,6 +8,11 @@ One-time setup:
        modal volume put room3d-checkpoints checkpoints/vggt_omega_1b_512.pt vggt_omega_1b_512.pt
   3. Secret for the Gemini auto-label button (or remove GEMINI_SECRET below):
        modal secret create gemini GEMINI_API_KEY=xxx
+  4. Secret guarding the editor's write endpoints — save/delete/upload/regenerate
+     have no other auth, so anyone with the deployed URL can use them without
+     this (or remove ROOM3D_AUTH_SECRET below to leave them open):
+       modal secret create room3d-auth ROOM3D_API_TOKEN=$(openssl rand -hex 24)
+     The editor prompts for this token once and caches it in localStorage.
 
 GDINO + SAM weights are ungated and download automatically on the first run
 (get_model / the detection path fetch them into the hf-cache Volume).
@@ -47,6 +52,9 @@ VOLUMES = {
 
 # gemini: only needed for the auto-label button in the UI.
 GEMINI_SECRET = [modal.Secret.from_name("gemini", required_keys=["GEMINI_API_KEY"])]
+# room3d-auth: shared-secret header the editor's write endpoints check (see
+# check_write_auth in src/app.py). Only needed on `web`, not the GPU job.
+ROOM3D_AUTH_SECRET = [modal.Secret.from_name("room3d-auth", required_keys=["ROOM3D_API_TOKEN"])]
 
 # Mirrors setup.sh: clone VGGT-Omega, install its requirements + ours.
 image = (
@@ -329,7 +337,7 @@ def run_reconstruction_job(job_id: str, params: dict) -> dict:
     cpu=2,
     memory=4096,
     volumes=VOLUMES,
-    secrets=GEMINI_SECRET,
+    secrets=GEMINI_SECRET + ROOM3D_AUTH_SECRET,
     timeout=600,
     scaledown_window=120,  # idle seconds before scale-to-zero stops billing
     max_containers=1,  # Gradio queue state is per-process — keep one container

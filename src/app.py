@@ -1516,6 +1516,20 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
     os.makedirs(SCENES_DIR, exist_ok=True)
     api = FastAPI()
 
+    ROOM3D_API_TOKEN = os.environ.get("ROOM3D_API_TOKEN")
+
+    def check_write_auth(request: Request) -> "JSONResponse | None":
+        """Shared-secret check for endpoints that mutate or delete scene data,
+        or trigger billable GPU work (regenerate). A no-op if ROOM3D_API_TOKEN
+        isn't set, so local dev (`python src/app.py`) needs no setup; set it
+        (and the matching modal secret) before exposing a deployment's URL
+        beyond trusted use, since these routes have no other auth."""
+        if not ROOM3D_API_TOKEN:
+            return None
+        if request.headers.get("x-room3d-token") != ROOM3D_API_TOKEN:
+            return JSONResponse({"error": "unauthorized"}, status_code=401)
+        return None
+
     async def commit_scene_changes():
         """Make editor mutations durable on Modal's shared scenes Volume."""
         if COMMIT_SCENES_FN is None:
@@ -1540,6 +1554,8 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
 
     @api.post("/api/scenes/{name}/layout")
     async def save_layout(name: str, request: Request):
+        if (auth_error := check_write_auth(request)) is not None:
+            return auth_error
         if "/" in name or "\\" in name or ".." in name:
             return JSONResponse({"error": "bad scene name"}, status_code=400)
         path = os.path.join(SCENES_DIR, name, "scene.json")
@@ -1598,7 +1614,8 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
 
     @api.post("/api/scenes/{name}/objects")
     async def add_object_model(
-        name: str, file: UploadFile = File(...), label: str = Form("New object"),
+        name: str, request: Request,
+        file: UploadFile = File(...), label: str = Form("New object"),
     ):
         """Add an independent GLB object to an existing editable scene.
 
@@ -1607,6 +1624,8 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
         floor, and starts at the room origin. The editor persists subsequent
         position, yaw and manual scale changes as reversible metadata.
         """
+        if (auth_error := check_write_auth(request)) is not None:
+            return auth_error
         if "/" in name or "\\" in name or ".." in name:
             return JSONResponse({"error": "bad scene name"}, status_code=400)
         scene_dir = os.path.join(SCENES_DIR, name)
@@ -1692,7 +1711,7 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
 
     @api.post("/api/scenes/{name}/objects/{obj_id}/model")
     async def replace_object_model(
-        name: str, obj_id: str,
+        name: str, obj_id: str, request: Request,
         file: UploadFile = File(...), scale: str = Form(...), offset: str = Form("[0,0,0]"),
     ):
         """Replace a detected object's mesh with an uploaded GLB.
@@ -1703,6 +1722,8 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
         point agreement without freely distorting the asset. Transforms remain
         metadata rather than being baked into the GLB, so they are reversible.
         """
+        if (auth_error := check_write_auth(request)) is not None:
+            return auth_error
         if "/" in name or "\\" in name or ".." in name:
             return JSONResponse({"error": "bad scene name"}, status_code=400)
         if "/" in obj_id or "\\" in obj_id or ".." in obj_id:
@@ -1801,7 +1822,9 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
         }
 
     @api.delete("/api/scenes/{name}/objects/{obj_id}")
-    async def delete_object(name: str, obj_id: str):
+    async def delete_object(name: str, obj_id: str, request: Request):
+        if (auth_error := check_write_auth(request)) is not None:
+            return auth_error
         if "/" in name or "\\" in name or ".." in name:
             return JSONResponse({"error": "bad scene name"}, status_code=400)
         if "/" in obj_id or "\\" in obj_id or ".." in obj_id:
@@ -1845,10 +1868,12 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
         return {"ok": True}
 
     @api.post("/api/scenes/{name}/objects/{obj_id}/regenerate")
-    async def regenerate_object(name: str, obj_id: str):
+    async def regenerate_object(name: str, obj_id: str, request: Request):
         """Regenerate one object's mesh with TRELLIS.2 from its saved input crop.
         Long-running (tens of seconds on the GPU): awaits the isolated TRELLIS
         Modal function, so the client shows a spinner while this is in flight."""
+        if (auth_error := check_write_auth(request)) is not None:
+            return auth_error
         if "/" in name or "\\" in name or ".." in name:
             return JSONResponse({"error": "bad scene name"}, status_code=400)
         if "/" in obj_id or "\\" in obj_id or ".." in obj_id:

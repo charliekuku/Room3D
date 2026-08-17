@@ -76,6 +76,7 @@ cp .env.example .env
 | Variable | Default | Description |
 |---|---|---|
 | `GEMINI_API_KEY` | — | Enables Gemini Vision auto-label button |
+| `ROOM3D_API_TOKEN` | — | Shared-secret header required by the editor's write endpoints (save/delete/upload/regenerate) — unset means no auth is enforced. Set this before exposing a deployment's URL beyond trusted use, since those routes have no other auth check |
 | `CHECKPOINT_PATH` | `checkpoints/vggt_omega_1b_512.pt` | Path to a custom checkpoint |
 | `IMAGE_RESOLUTION` | 256 (128 on low-RAM MPS) | Inference resolution in pixels |
 
