@@ -690,13 +690,26 @@ def _verify_instance_geometry(inst: dict, floor_y: float,
             0.20 * (1.0 - point_overlap), 0.0, 1.0,
         )) if inside_ratio > 0 else 0.0
     )
-    reject = bool(
+    reflection_reject = bool(
         len(frames) >= 2 and reflector_hits >= 2 and inside_ratio >= 0.70 and
         reflection_conflict and reflection_score >= 0.65
     )
-    status = "rejected_reflection" if reject else (
-        "uncertain" if inside_ratio >= 0.50 or len(frames) < 2 else "accepted"
-    )
+    # Floor gap alone is not evidence of a bad placement — monocular scans
+    # routinely miss thin legs on well-observed furniture (see the 0.17-ish
+    # ratios on this scene's well-tracked chairs). Only reject when the gap is
+    # both large (nowhere near normal leg-occlusion noise) and the instance is
+    # one of the thin-evidence fragments the rest of this module already
+    # treats as unreliable.
+    unsupported = bool(len(frames) <= 3 and floor_gap_ratio >= 0.30)
+    reject = reflection_reject or unsupported
+    if reflection_reject:
+        status = "rejected_reflection"
+    elif unsupported:
+        status = "rejected_unsupported"
+    elif inside_ratio >= 0.50 or len(frames) < 2:
+        status = "uncertain"
+    else:
+        status = "accepted"
     return {
         "status": status,
         "geometry_score": round(geometry_score, 3),
@@ -716,6 +729,7 @@ def _verify_instance_geometry(inst: dict, floor_y: float,
         "reflector_inside_ratio": round(inside_ratio, 3),
         "reflector_frames": int(reflector_hits),
         "reflector_labels": reflector_labels,
+        "unsupported": unsupported,
         "frames": len(frames),
         "reject": reject,
     }
@@ -733,7 +747,7 @@ def _filter_reflection_instances(instances: list[dict], floor_y: float,
             rejected.append({
                 "label": str(inst.get("label", "object")),
                 "score": round(float(inst.get("score", 0.0)), 3),
-                "reason": "reflection",
+                "reason": "unsupported" if audit["status"] == "rejected_unsupported" else "reflection",
                 "verification": audit,
             })
         else:
@@ -2952,8 +2966,9 @@ def build_scene(
     association_summary["instances_after_reflection_check"] = len(instances)
     if reflection_summary["rejected"]:
         print(
-            f"[SceneBuilder] Reflection verification rejected "
-            f"{reflection_summary['rejected']} candidate(s)."
+            f"[SceneBuilder] Geometry verification rejected "
+            f"{reflection_summary['rejected']} candidate(s) "
+            f"(reflection and/or unsupported floating placement)."
         )
     # Always rebuild this after all semantic and geometric rejection. Otherwise
     # a discarded reflected object would still carve a hole in the background.

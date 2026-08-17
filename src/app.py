@@ -1570,23 +1570,125 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
                 try:
                     position = [float(v) for v in upd["position"]]
                     yaw = float(upd["yaw"])
+                    editor_scale = [float(v) for v in upd.get(
+                        "editor_scale", obj.get("editor_scale", [1, 1, 1])
+                    )]
                     if len(position) != 3 or not all(math.isfinite(v) for v in position):
                         raise ValueError
                     if not math.isfinite(yaw):
                         raise ValueError
+                    if (len(editor_scale) != 3
+                            or any(not math.isfinite(v) or v < 0.01 or v > 100
+                                   for v in editor_scale)):
+                        raise ValueError
                 except (KeyError, OverflowError, TypeError, ValueError):
                     return JSONResponse(
-                        {"error": "position must be three finite numbers and yaw must be finite"},
+                        {"error": "position, yaw, or editor scale is invalid"},
                         status_code=400,
                     )
                 obj["position"] = [round(v, 4) for v in position]
                 obj["yaw"] = round(yaw, 5)
+                obj["editor_scale"] = [round(v, 5) for v in editor_scale]
                 if "label" in upd:
                     obj["label"] = upd["label"]
                 n += 1
         write_scene_json(path, scene_json)
         await commit_scene_changes()
         return {"ok": True, "updated": n}
+
+    @api.post("/api/scenes/{name}/objects")
+    async def add_object_model(
+        name: str, file: UploadFile = File(...), label: str = Form("New object"),
+    ):
+        """Add an independent GLB object to an existing editable scene.
+
+        Uploaded geometry keeps its own units (glTF conventionally uses
+        metres), is re-centred horizontally with its lowest point on the
+        floor, and starts at the room origin. The editor persists subsequent
+        position, yaw and manual scale changes as reversible metadata.
+        """
+        if "/" in name or "\\" in name or ".." in name:
+            return JSONResponse({"error": "bad scene name"}, status_code=400)
+        scene_dir = os.path.join(SCENES_DIR, name)
+        path = os.path.join(scene_dir, "scene.json")
+        if not os.path.exists(path):
+            return JSONResponse({"error": "scene not found"}, status_code=404)
+
+        label = label.strip()
+        if (not label or len(label) > 100
+                or any(ord(ch) < 32 for ch in label)):
+            return JSONResponse(
+                {"error": "label must be 1-100 printable characters"},
+                status_code=400,
+            )
+
+        content = await file.read()
+        if len(content) > 100 * 1024 * 1024:
+            return JSONResponse({"error": "GLB must be 100 MB or smaller"}, status_code=413)
+        if content[:4] != b"glTF":
+            return JSONResponse({"error": "file must be a binary .glb"}, status_code=400)
+
+        try:
+            import io
+            import trimesh
+
+            loaded = trimesh.load(io.BytesIO(content), file_type="glb", process=False)
+            geometry = loaded.to_geometry() if isinstance(loaded, trimesh.Scene) else loaded
+            bounds = np.asarray(geometry.bounds, dtype=float)
+            size = bounds[1] - bounds[0]
+            if (bounds.shape != (2, 3) or not np.all(np.isfinite(bounds))
+                    or np.any(size <= 1e-6)):
+                raise ValueError("degenerate bounds")
+        except Exception:
+            return JSONResponse(
+                {"error": "GLB has no valid mesh geometry"}, status_code=400,
+            )
+
+        with open(path) as f:
+            scene_json = json.load(f)
+        existing_ids = {str(o.get("id")) for o in scene_json.get("objects", [])}
+        while True:
+            obj_id = f"custom_{uuid.uuid4().hex[:10]}"
+            if obj_id not in existing_ids:
+                break
+
+        glb_rel = f"objects/{obj_id}.glb"
+        glb_path = os.path.join(scene_dir, glb_rel)
+        os.makedirs(os.path.dirname(glb_path), exist_ok=True)
+        with tempfile.NamedTemporaryFile(
+            suffix=".glb", dir=os.path.dirname(glb_path), delete=False,
+        ) as tmp:
+            tmp_glb_path = tmp.name
+            tmp.write(content)
+        try:
+            os.replace(tmp_glb_path, glb_path)
+        finally:
+            if os.path.exists(tmp_glb_path):
+                os.remove(tmp_glb_path)
+
+        center = (bounds[0] + bounds[1]) / 2.0
+        obj = {
+            "id": obj_id,
+            "label": label,
+            "position": [0.0, 0.0, 0.0],
+            "yaw": 0.0,
+            "size": [round(float(v), 5) for v in size],
+            "editor_scale": [1.0, 1.0, 1.0],
+            "model_scale": [1.0, 1.0, 1.0],
+            "model_offset": [
+                round(float(-center[0]), 5),
+                round(float(-bounds[0, 1]), 5),
+                round(float(-center[2]), 5),
+            ],
+            "glb": glb_rel,
+            "source": "custom-upload",
+            "score": 1.0,
+            "frames_seen": 0,
+        }
+        scene_json.setdefault("objects", []).append(obj)
+        write_scene_json(path, scene_json)
+        await commit_scene_changes()
+        return {"ok": True, "object": obj}
 
     @api.post("/api/scenes/{name}/objects/{obj_id}/model")
     async def replace_object_model(
@@ -1766,9 +1868,10 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
         if obj is None:
             return JSONResponse({"error": "object not found"}, status_code=404)
 
-        # TRELLIS.2 is configured to use Room3D's saved SAM alpha rather than
-        # downloading/running a second background-removal model. A plain JPEG
-        # photo therefore cannot be used as a silent fallback here.
+        # Prefer Room3D's saved SAM alpha: it identifies the exact tracked
+        # instance even when another object overlaps the crop. Older scenes may
+        # lack that file, so fall back to the support photo and let TRELLIS's
+        # automatic BiRefNet remover isolate its main foreground subject.
         crop = None
         rel = obj.get("input_crop")
         if rel and os.path.exists(os.path.join(scene_dir, rel)):
@@ -1776,8 +1879,14 @@ def build_server(run_job_fn=None, job_status_dict=None, commit_scenes_fn=None,
             if img is not None and img.ndim == 3 and img.shape[2] == 4:
                 crop = cv2.cvtColor(img, cv2.COLOR_BGRA2RGBA)
         if crop is None:
+            rel = obj.get("photo")
+            if rel and os.path.exists(os.path.join(scene_dir, rel)):
+                img = cv2.imread(os.path.join(scene_dir, rel), cv2.IMREAD_COLOR)
+                if img is not None:
+                    crop = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        if crop is None:
             return JSONResponse(
-                {"error": "no RGBA SAM input crop saved for this object; reconstruct the scene first"},
+                {"error": "no SAM crop or support photo saved for this object; reconstruct the scene first"},
                 status_code=400,
             )
 

@@ -106,6 +106,75 @@ def test_viewer_api_save_layout(mock_scene_dir):
     assert updated_obj["label"] == "network cabinet", "Label was not updated on disk"
 
 
+def test_add_uploaded_object_and_persist_manual_scale(mock_scene_dir):
+    scene_name, scene_path = mock_scene_dir
+    mesh = trimesh.creation.box(extents=[2.0, 3.0, 4.0])
+    mesh.apply_translation([10.0, -2.0, 5.0])
+    calls = {"commit": 0}
+
+    async def commit():
+        calls["commit"] += 1
+
+    client = TestClient(build_server(commit_scenes_fn=commit))
+    response = client.post(
+        f"/api/scenes/{scene_name}/objects",
+        files={"file": ("meeting-table.glb", mesh.export(file_type="glb"),
+                        "model/gltf-binary")},
+        data={"label": "Meeting table"},
+    )
+
+    assert response.status_code == 200, response.text
+    obj = response.json()["object"]
+    assert obj["id"].startswith("custom_")
+    assert obj["label"] == "Meeting table"
+    assert obj["source"] == "custom-upload"
+    assert obj["size"] == [2.0, 3.0, 4.0]
+    assert obj["model_offset"] == [-10.0, 3.5, -5.0]
+    assert obj["editor_scale"] == [1.0, 1.0, 1.0]
+    assert (scene_path / obj["glb"]).exists()
+    assert calls["commit"] == 1
+
+    response = client.post(
+        f"/api/scenes/{scene_name}/layout",
+        json={"objects": [{
+            "id": obj["id"], "label": "Large meeting table",
+            "position": [1.0, 0.0, -2.0], "yaw": 0.75,
+            "editor_scale": [0.5, 2.0, 1.5],
+        }]},
+    )
+    assert response.status_code == 200, response.text
+    assert calls["commit"] == 2
+    with open(scene_path / "scene.json") as f:
+        saved = json.load(f)
+    added = next(o for o in saved["objects"] if o["id"] == obj["id"])
+    assert added["label"] == "Large meeting table"
+    assert added["position"] == [1.0, 0.0, -2.0]
+    assert added["yaw"] == 0.75
+    assert added["editor_scale"] == [0.5, 2.0, 1.5]
+
+
+def test_add_object_rejects_invalid_glb_and_layout_scale(mock_scene_dir):
+    scene_name, _ = mock_scene_dir
+    client = TestClient(build_server())
+
+    response = client.post(
+        f"/api/scenes/{scene_name}/objects",
+        files={"file": ("bad.glb", b"glTFnot-a-real-file", "model/gltf-binary")},
+        data={"label": "Bad model"},
+    )
+    assert response.status_code == 400
+
+    response = client.post(
+        f"/api/scenes/{scene_name}/layout",
+        json={"objects": [{
+            "id": "obj_000", "label": "server rack",
+            "position": [0, 0, 0], "yaw": 0,
+            "editor_scale": [-1, 1, 1],
+        }]},
+    )
+    assert response.status_code == 400
+
+
 def test_viewer_mutations_commit_and_uploaded_model_detaches_shared_asset(mock_scene_dir):
     scene_name, scene_path = mock_scene_dir
     objects_dir = scene_path / "objects"

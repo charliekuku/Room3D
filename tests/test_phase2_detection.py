@@ -644,6 +644,45 @@ def test_geometry_verification_keeps_single_frame_reflection_as_uncertain():
     assert audit["reject"] is False
 
 
+def test_geometry_verification_rejects_floating_object_with_thin_evidence():
+    # Table-sized box centred well above the floor (~1.05 gap in a 3.0-tall
+    # room => floor_gap_ratio ~0.35), tracked in only 2 frames. Mirrors the
+    # real obj_014 case: 2 frames, floor_gap_ratio 0.48, no detected reflector.
+    observations = []
+    for frame in range(2):
+        pts = _box_points([0, 1.2, 0], [0.6, 0.3, 0.6], n=1200, seed=900 + frame)
+        observations.append(sb._make_observation(
+            "table", 0.42, frame, pts, np.zeros((len(pts), 3), np.uint8),
+        ))
+    inst = sb._instance_from_observations(observations)
+
+    audit = sb._verify_instance_geometry(inst, floor_y=0.0, room_height=3.0)
+
+    assert audit["floor_gap_ratio"] >= 0.30
+    assert audit["unsupported"] is True
+    assert audit["status"] == "rejected_unsupported"
+    assert audit["reject"] is True
+
+
+def test_geometry_verification_keeps_floating_object_with_strong_evidence():
+    # Same elevated placement as above, but well-observed (>3 frames) — e.g. a
+    # wall-mounted shelf. Thin evidence is required to reject on floor gap
+    # alone, so this must stay accepted despite the identical gap.
+    observations = []
+    for frame in range(5):
+        pts = _box_points([0, 1.2, 0], [0.6, 0.3, 0.6], n=1200, seed=910 + frame)
+        observations.append(sb._make_observation(
+            "shelf", 0.80, frame, pts, np.zeros((len(pts), 3), np.uint8),
+        ))
+    inst = sb._instance_from_observations(observations)
+
+    audit = sb._verify_instance_geometry(inst, floor_y=0.0, room_height=3.0)
+
+    assert audit["floor_gap_ratio"] >= 0.30
+    assert audit["unsupported"] is False
+    assert audit["reject"] is False
+
+
 def test_reflector_and_nested_reflection_are_never_cross_label_merged():
     plane = _vertical_reflection_points(0)
     tv = sb._make_observation(

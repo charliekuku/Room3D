@@ -4,8 +4,6 @@
 
 Powered by [VGGT-Omega](https://github.com/facebookresearch/vggt-omega) (CVPR 2026 Oral — Meta Research & VGG Oxford). Upload 5–30 overlapping photos and get a dense 3D point cloud or mesh in seconds — no calibration, no markers.
 
-![Room3D demo UI](https://github.com/user-attachments/assets/placeholder)
-
 ## Features
 
 - **Point cloud & mesh output** — point cloud, TSDF (watertight), or Poisson surface reconstruction
@@ -41,7 +39,7 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
 **2. Clone and install dependencies:**
 
 ```bash
-git clone https://github.com/your-username/Room3D.git
+git clone https://github.com/charliekuku/Room3D.git
 cd Room3D
 bash setup.sh
 ```
@@ -136,6 +134,24 @@ How positions stay accurate: each object is placed from SAM-masked depth pixels 
 across *all* frames it appears in (median centre, percentile extents), single-frame
 low-confidence detections are discarded, bases snap to the RANSAC-fitted floor plane, and
 yaw snaps to the room's 90° grid when close.
+
+## Generate one GLB from your own photo with TRELLIS.2
+
+After deploying `modal_app.py`, an authenticated Modal user can upload a local
+JPG, WebP, or PNG directly to the isolated TRELLIS.2 L4 function:
+
+```bash
+modal run modal_app.py::trellis_upload \
+  --image-path data/chair.jpg \
+  --output-path outputs/chair.glb
+```
+
+Ordinary photos are automatically segmented with the ungated MIT-licensed
+`ZhengPeng7/BiRefNet` model. A PNG that already contains useful transparency
+keeps its supplied alpha instead. For best results, use one clearly visible
+object, avoid severe occlusion, include the complete silhouette, and leave a
+little space around it. The first call after scale-to-zero loads the background
+remover and TRELLIS weights; later calls reuse the warm container.
 
 ## License
 
