@@ -425,6 +425,23 @@ function toast(msg, ms = 2500) {
   t._h = setTimeout(() => (t.style.opacity = 0), ms);
 }
 
+// ── Write auth ──────────────────────────────────────────────────────────────
+// Prompted once and cached; a no-op (empty string) if the server has no
+// ROOM3D_API_TOKEN set, since check_write_auth then accepts any request.
+function authHeaders(extra = {}) {
+  let token = localStorage.getItem('room3d_token');
+  if (token === null) {
+    token = prompt('Room3D write token (leave blank if none is required):') || '';
+    localStorage.setItem('room3d_token', token);
+  }
+  return token ? { ...extra, 'X-Room3D-Token': token } : extra;
+}
+// If the saved token is wrong, clear it so the next write re-prompts instead
+// of failing silently forever.
+function handleAuthFailure(status) {
+  if (status === 401) localStorage.removeItem('room3d_token');
+}
+
 function makeLabel(text, size) {
   const canvas = document.createElement('canvas');
   const ctx = canvas.getContext('2d');
@@ -1053,9 +1070,12 @@ async function deleteSelectedObject() {
   if (!confirm(`Delete "${obj.label}" from the scene? This cannot be undone.`)) return;
 
   try {
-    const r = await fetch(`/api/scenes/${sceneName}/objects/${id}`, { method: 'DELETE' });
+    const r = await fetch(`/api/scenes/${sceneName}/objects/${id}`, {
+      method: 'DELETE', headers: authHeaders(),
+    });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
+      handleAuthFailure(r.status);
       toast(`Delete failed — ${err.error || r.status}`);
       return;
     }
@@ -1097,9 +1117,12 @@ $('btn-regen').onclick = async () => {
   toast('Regenerating with TRELLIS.2 — this can take up to a minute…', 90000);
   let result;
   try {
-    const r = await fetch(`/api/scenes/${sceneName}/objects/${id}/regenerate`, { method: 'POST' });
+    const r = await fetch(`/api/scenes/${sceneName}/objects/${id}/regenerate`, {
+      method: 'POST', headers: authHeaders(),
+    });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
+      handleAuthFailure(r.status);
       toast(`Regenerate failed — ${err.error || r.status}`);
       return;
     }
@@ -1143,10 +1166,11 @@ $('file-object-add').onchange = async (e) => {
 
   try {
     const response = await fetch(`/api/scenes/${sceneName}/objects`, {
-      method: 'POST', body: form,
+      method: 'POST', headers: authHeaders(), body: form,
     });
     const result = await response.json().catch(() => ({}));
     if (!response.ok || !result.object) {
+      handleAuthFailure(response.status);
       toast(`Add failed — ${result.error || response.status}`);
       return;
     }
@@ -1200,10 +1224,11 @@ $('file-model-upload').onchange = (e) => {
       let result;
       try {
         const r = await fetch(`/api/scenes/${sceneName}/objects/${id}/model`, {
-          method: 'POST', body: form,
+          method: 'POST', headers: authHeaders(), body: form,
         });
         result = await r.json().catch(() => ({}));
         if (!r.ok) {
+          handleAuthFailure(r.status);
           toast(`Upload failed — ${result.error || r.status}`);
           return;
         }
@@ -1250,9 +1275,10 @@ $('btn-save').onclick = async () => {
   try {
     const r = await fetch(`/api/scenes/${sceneName}/layout`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: authHeaders({ 'Content-Type': 'application/json' }),
       body: JSON.stringify({ objects }),
     });
+    handleAuthFailure(r.status);
     toast(r.ok ? 'Layout saved back to disk ✓' : `Save failed (${r.status})`);
   } catch (err) {
     toast('Save failed — is app.py server running?');

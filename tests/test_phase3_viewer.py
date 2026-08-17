@@ -334,3 +334,57 @@ def test_regenerate_detaches_reused_asset_and_commits(mock_scene_dir):
     assert selected["source"] == "trellis"
     assert "reuse_of" not in selected
     assert shared["glb"] == shared_rel
+
+
+def test_write_auth_no_op_when_unset(mock_scene_dir, monkeypatch):
+    """No ROOM3D_API_TOKEN configured -> writes succeed with no header at all,
+    matching every other test in this file (local dev needs no setup)."""
+    monkeypatch.delenv("ROOM3D_API_TOKEN", raising=False)
+    scene_name, _ = mock_scene_dir
+    client = TestClient(build_server())
+
+    response = client.post(f"/api/scenes/{scene_name}/layout", json={"objects": []})
+
+    assert response.status_code == 200
+
+
+def test_write_auth_rejects_missing_or_wrong_token(mock_scene_dir, monkeypatch):
+    monkeypatch.setenv("ROOM3D_API_TOKEN", "correct-token")
+    scene_name, _ = mock_scene_dir
+    client = TestClient(build_server())
+
+    no_header = client.post(f"/api/scenes/{scene_name}/layout", json={"objects": []})
+    wrong_header = client.post(
+        f"/api/scenes/{scene_name}/layout", json={"objects": []},
+        headers={"X-Room3D-Token": "wrong-token"},
+    )
+
+    assert no_header.status_code == 401
+    assert wrong_header.status_code == 401
+
+
+def test_write_auth_accepts_correct_token(mock_scene_dir, monkeypatch):
+    monkeypatch.setenv("ROOM3D_API_TOKEN", "correct-token")
+    scene_name, _ = mock_scene_dir
+    client = TestClient(build_server())
+
+    response = client.post(
+        f"/api/scenes/{scene_name}/layout", json={"objects": []},
+        headers={"X-Room3D-Token": "correct-token"},
+    )
+
+    assert response.status_code == 200
+
+
+def test_write_auth_covers_delete_and_regenerate(mock_scene_dir, monkeypatch):
+    """The two endpoints without a json body/Request param originally — make
+    sure adding auth to them didn't just silently no-op."""
+    monkeypatch.setenv("ROOM3D_API_TOKEN", "correct-token")
+    scene_name, _ = mock_scene_dir
+    client = TestClient(build_server())
+
+    delete_resp = client.delete(f"/api/scenes/{scene_name}/objects/obj_000")
+    regen_resp = client.post(f"/api/scenes/{scene_name}/objects/obj_000/regenerate")
+
+    assert delete_resp.status_code == 401
+    assert regen_resp.status_code == 401
